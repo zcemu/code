@@ -1,0 +1,100 @@
+name: Build Custom Portable App
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # 关键步骤：在编译前自动运行脚本，把横幅、广告和便携路径改掉
+      - name: Apply Custom Modifications
+        shell: bash
+        run: |
+          echo "正在清理广告和 Plus 横幅..."
+          
+          # 1. 自动注入便携版逻辑到 Rust 入口 (main.rs)
+          MAIN_RS=$(find . -name "main.rs" | grep "src-tauri" | head -n 1)
+          if [ -f "$MAIN_RS" ]; then
+            echo "找到入口文件: $MAIN_RS，正在注入便携版路径..."
+            # 在 main 函数头部插入环境变量设置
+            python3 -c "
+            path = '$MAIN_RS'
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            portable_code = '''
+            // 自动便携版路径重定向
+            if let Ok(exe_path) = std::env::current_exe() {
+                if let Some(exe_dir) = exe_path.parent() {
+                    let data_dir = exe_dir.join(\"data\");
+                    if !data_dir.exists() {
+                        let _ = std::fs::create_dir_all(&data_dir);
+                    }
+                    unsafe { std::env::set_var(\"THESEUS_CONFIG_DIR\", data_dir.to_str().unwrap()); }
+                }
+            }
+            '''
+            
+            # 插入到 fn main() 后面
+            new_content = content.replace('fn main() {', 'fn main() {' + portable_code)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            "
+          fi
+
+          # 2. 注入全局 CSS 隐藏右侧 Plus 横幅和广告
+          CSS_FILE=$(find . -name "index.css" -o -name "App.css" | head -n 1)
+          if [ -f "$CSS_FILE" ]; then
+            echo "正在向 $CSS_FILE 注入去广告样式..."
+            echo "
+            /* 自定义清理：隐藏广告及右侧 Plus 宣传横幅 */
+            div[class*='plus'], div[class*='banner'], div[class*='advertisement'], section[class*='plus'] {
+                display: none !important;
+            }
+            " >> "$CSS_FILE"
+          fi
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build Tauri App
+        run: pnpm --filter app build
+        env:
+          NODE_ENV: production
+
+      - name: Package Portable ZIP
+        shell: bash
+        run: |
+          mkdir -p portable_output/data
+          find . -name "*.exe" | grep "release" | head -n 1 | xargs -I {} cp {} portable_output/
+          cd portable_output
+          zip -r ../ModrinthApp-Clean-Portable-Win64.zip *
+
+      - name: Upload to GitHub Releases
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: ModrinthApp-Clean-Portable-Win64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
