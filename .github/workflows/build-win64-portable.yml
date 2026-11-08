@@ -28,8 +28,19 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Apply patch（开启便携 + 移除广告Plus横幅）
-        run: bash scripts/patch.sh
+           - name: Patch Tauri config (portable mode, node)
+        run: node scripts/patch.js
+
+      - name: Patch remove ads & plus banner (sed)
+        run: |
+          # 注释广告初始化
+          sed -i 's/init_ads();/\/\/ init_ads();/' apps/app/src/main.rs
+          # 清空广告iframe
+          echo "" > apps/frontend/src/public/promo-frame.html
+          # 注释Plus横幅组件
+          sed -i 's/<ModrinthPlusBanner //<!-- <ModrinthPlusBanner /g' apps/frontend/**/*.vue
+          sed -i 's/\/ModrinthPlusBanner>/\/ModrinthPlusBanner -->/g' apps/frontend/**/*.vue
+
 
       - name: Build Tauri app
         run: pnpm app:build
