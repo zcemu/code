@@ -1,0 +1,92 @@
+name: Build Portable and Clean App
+
+on:
+  push:
+    tags:
+      - 'v*' # 只要你打类似 v1.0.0 的标签，就会自动触发专属构建
+
+jobs:
+  build-portable:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # 1. 自动注入便携版逻辑与去广告横幅代码
+      - name: Apply Custom Modifications
+        shell: bash
+        run: |
+          echo "正在修改 Rust 后端实现便携版..."
+          MAIN_RS="apps/app/src-tauri/src/main.rs"
+          if [ -f "$MAIN_RS" ]; then
+            python3 -c "
+            with open('$MAIN_RS', 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            portable_snippet = '''
+            if let Ok(exe_path) = std::env::current_exe() {
+                if let Some(exe_dir) = exe_path.parent() {
+                    let data_dir = exe_dir.join(\"data\");
+                    if !data_dir.exists() { let _ = std::fs::create_dir_all(&data_dir); }
+                    unsafe { std::env::set_var(\"THESEUS_CONFIG_DIR\", data_dir.to_str().unwrap()); }
+                }
+            }
+            '''
+
+            new_content = content.replace('fn main() {', 'fn main() {' + portable_snippet)
+            with open('$MAIN_RS', 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            "
+          fi
+
+          echo "正在注入前端样式隐藏右侧 Plus 横幅与广告..."
+          CSS_FILE=$(find apps/app -name "index.css" -o -name "style.css" | head -n 1)
+          if [ -f "$CSS_FILE" ]; then
+            echo "
+            /* 自动注入：隐藏右侧 Plus 横幅与广告 */
+            div[class*='plus'], div[class*='banner'], aside[class*='plus'], section[class*='promo'] {
+                display: none !important;
+            }
+            " >> "$CSS_FILE"
+          fi
+
+      # 2. 安装依赖并编译 Tauri 客户端
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build Tauri App
+        run: pnpm --filter app build
+        env:
+          NODE_ENV: production
+
+      # 3. 打包成带 data 文件夹的 ZIP 并自动发布到 Releases
+      - name: Package Portable ZIP
+        shell: bash
+        run: |
+          mkdir -p portable_output/data
+          find . -name "*.exe" | grep "release" | head -n 1 | xargs -I {} cp {} portable_output/
+          cd portable_output
+          zip -r ../ModrinthApp-Portable-Win64.zip *
+
+      - name: Upload to GitHub Releases
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: ModrinthApp-Portable-Win64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
