@@ -6,41 +6,41 @@ permissions:
 jobs:
   build-win64:
     runs-on: windows-latest
+    env:
+      PNPM_IGNORE_PACKAGE_MANAGER_CHECK: true
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
-        # 重点：移除 version 字段，自动读取 package.json 的 pnpm@12.11.2
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+
       - name: Install Tauri CLI
         run: cargo install tauri-cli --locked
 
       - name: Install dependencies
         run: pnpm install
 
-           - name: Patch Tauri config (portable mode, node)
+      - name: Patch Tauri config (portable mode, node)
         run: node scripts/patch.js
 
       - name: Patch remove ads & plus banner (sed)
         run: |
-          # 注释广告初始化
           sed -i 's/init_ads();/\/\/ init_ads();/' apps/app/src/main.rs
-          # 清空广告iframe
           echo "" > apps/frontend/src/public/promo-frame.html
-          # 注释Plus横幅组件
           sed -i 's/<ModrinthPlusBanner //<!-- <ModrinthPlusBanner /g' apps/frontend/**/*.vue
           sed -i 's/\/ModrinthPlusBanner>/\/ModrinthPlusBanner -->/g' apps/frontend/**/*.vue
-
 
       - name: Build Tauri app
         run: pnpm app:build
