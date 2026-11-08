@@ -1,6 +1,6 @@
 name: Build Win64 Portable (No Ads)
 on:
-  workflow_dispatch: # ✅ 网页手动点按钮触发，不用打tag、不用命令
+  workflow_dispatch:
 permissions:
   contents: write
 jobs:
@@ -12,8 +12,7 @@ jobs:
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: 9
+        # 重点：移除 version 字段，自动读取 package.json 的 pnpm@12.11.2
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
