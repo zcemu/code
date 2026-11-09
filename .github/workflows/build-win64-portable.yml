@@ -32,22 +32,47 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Apply all patches (inline fixed)
+      - name: Apply patches via Node (no unix find, no powershell conflict)
         run: |
           node -e "
             const fs = require('fs');
-            const p = 'apps/app/tauri.conf.json';
-            const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+            const path = require('path');
+            // 1. 开启便携模式
+            const confPath = 'apps/app/tauri.conf.json';
+            const cfg = JSON.parse(fs.readFileSync(confPath, 'utf8'));
             if (!cfg.bundle) cfg.bundle = {};
             if (!cfg.bundle.windows) cfg.bundle.windows = {};
             cfg.bundle.windows.portable = true;
-            fs.writeFileSync(p, JSON.stringify(cfg, null, 2), 'utf8');
+            fs.writeFileSync(confPath, JSON.stringify(cfg, null, 2), 'utf8');
             console.log('✅ Portable enabled');
+
+            // 2. 递归遍历src目录下所有vue文件
+            function walk(dir) {
+              const entries = fs.readdirSync(dir, {withFileTypes:true});
+              for(const e of entries){
+                const full = path.join(dir, e.name);
+                if(e.isDirectory()) walk(full);
+                else if(e.isFile() && full.endsWith('.vue')){
+                  let txt = fs.readFileSync(full, 'utf8');
+                  txt = txt.replace(/<ModrinthPlusBanner /g, '<!-- <ModrinthPlusBanner ');
+                  txt = txt.replace(/\/ModrinthPlusBanner>/g, '/ModrinthPlusBanner -->');
+                  fs.writeFileSync(full, txt, 'utf8');
+                }
+              }
+            }
+            walk('apps/frontend/src');
+            console.log('✅ Plus banner commented');
+
+            // 3. 清空广告页面
+            fs.writeFileSync('apps/frontend/src/public/promo-frame.html','','utf8');
+            console.log('✅ Promo cleared');
+
+            // 4. 注释广告初始化代码
+            let rsTxt = fs.readFileSync('apps/app/src/main.rs','utf8');
+            rsTxt = rsTxt.replace(/init_ads\(\);/g,'// init_ads();');
+            fs.writeFileSync('apps/app/src/main.rs', rsTxt, 'utf8');
+            console.log('✅ Ads init commented');
           "
-          sed -i 's/init_ads();/\/\/ init_ads();/' apps/app/src/main.rs
-          echo "" > apps/frontend/src/public/promo-frame.html
-          find apps/frontend/src -type f -name "*.vue" -exec sed -i 's/<ModrinthPlusBanner /<!-- <ModrinthPlusBanner /g' {} \;
-          find apps/frontend/src -type f -name "*.vue" -exec sed -i 's/\/ModrinthPlusBanner>/\/ModrinthPlusBanner -->/g' {} \;
 
       - name: Build Tauri app
         run: pnpm app:build
