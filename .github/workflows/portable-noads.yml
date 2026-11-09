@@ -1,5 +1,5 @@
 
-name: Build Win64 Portable NoAds
+name: Build Win64 Portable NoAdsb
 
 on:
   workflow_dispatch:
