@@ -4,9 +4,9 @@ name: Build Win64 Portable NoAds
 on:
   workflow_dispatch:
 
-# 防止重复触发造成并行编译
+# 避免重复构建浪费 Actions 时间
 concurrency:
-  group: portable-win64-noads
+  group: modrinth-portable-win64
   cancel-in-progress: true
 
 permissions:
@@ -14,55 +14,69 @@ permissions:
 
 jobs:
   build-win64:
-    name: Build Windows Portable
+    name: Build Modrinth Portable
     runs-on: windows-latest
     timeout-minutes: 90
 
-    env:
-      TURBO_TELEMETRY_DISABLED: 1
-      PNPM_IGNORE_PACKAGE_MANAGER_CHECK: true
-
     steps:
-      # 1. 获取 Modrinth 源码
+      # 1. 获取源码
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # 2. Node.js（跟随官方版本）
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-          cache: pnpm
-
-      # 3. pnpm（跟随仓库 packageManager）
+      # 2. 先安装 pnpm
+      # setup-node 的 pnpm 缓存依赖它
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 12.11.2
           run_install: false
 
-      # 4. Rust（跟随官方 toolchain）
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.95.0
+      # 3. 安装 Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      # 4. Rust 工具链
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
           targets: x86_64-pc-windows-msvc
 
-      # 5. 缓存 Rust 编译结果
+      # 5. Rust 编译缓存
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
 
-      # 6. 安装依赖
+      # 6. 检查编译环境
+      - name: Verify toolchain
+        shell: pwsh
+        run: |
+          node --version
+          pnpm --version
+          rustc --version
+          cargo --version
+          pnpm --filter @modrinth/app exec tauri --version
+
+      # 7. 安装项目依赖
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # 7. 配置 Modrinth 生产环境
+      # 8. 配置生产环境
       - name: Setup production environment
         shell: pwsh
         run: |
-          Copy-Item "packages/app-lib/.env.prod" `
-            "packages/app-lib/.env" -Force
+          $source = "packages/app-lib/.env.prod"
+          $destination = "packages/app-lib/.env"
 
-      # 8. 去广告 + 便携模式修改
+          if (!(Test-Path $source)) {
+            throw "Production environment file not found: $source"
+          }
+
+          Copy-Item $source $destination -Force
+
+      # 9. 去广告及便携模式补丁
       - name: Apply Portable and NoAds patches
         shell: pwsh
         run: |
@@ -70,13 +84,44 @@ jobs:
           const fs = require('fs');
           const path = require('path');
 
-          // A. 关闭安装包生成，只保留 EXE
-          const confPath = 'apps/app/tauri.conf.json';
-          const cfg = JSON.parse(fs.readFileSync(confPath, 'utf8'));
+          function replaceExactlyOnce(text, regex, replacement, name) {
+            const matches = text.match(regex);
+            if (!matches || matches.length !== 1) {
+              throw new Error(
+                `${name}: expected exactly one match, found ${matches ? matches.length : 0}`
+              );
+            }
+            return text.replace(regex, replacement);
+          }
 
+          // ==========================================
+          // A. Tauri 配置
+          // ==========================================
+
+          const confPath = 'apps/app/tauri.conf.json';
+
+          const cfg = JSON.parse(
+            fs.readFileSync(confPath, 'utf8')
+          );
+
+          // 不生成 MSI / NSIS 安装包
+          // 只保留 Cargo 编译出来的 EXE
           cfg.bundle = cfg.bundle || {};
           cfg.bundle.active = false;
 
+          // 移除广告插件的 Tauri capability
+          if (
+            cfg.app &&
+            cfg.app.security &&
+            Array.isArray(cfg.app.security.capabilities)
+          ) {
+            cfg.app.security.capabilities =
+              cfg.app.security.capabilities.filter(
+                item => item !== 'ads'
+              );
+          }
+
+          // 删除之前错误的 portable 字段
           if (cfg.bundle.windows) {
             delete cfg.bundle.windows.portable;
           }
@@ -87,136 +132,252 @@ jobs:
             'utf8'
           );
 
-          console.log('Portable executable build enabled');
+          console.log('Tauri configuration patched');
 
-          // B. 移除 Modrinth Plus Banner
+          // ==========================================
+          // B. 修改 Rust 主程序
+          // ==========================================
+
+          const mainPath = 'apps/app/src/main.rs';
+
+          let rust = fs.readFileSync(mainPath, 'utf8');
+
+          // 关闭真正的原生广告插件
+          const adsPluginPattern =
+            /^[ \t]*\.plugin\(api::ads::init\(\)\)[ \t]*\r?\n/m;
+
+          rust = replaceExactlyOnce(
+            rust,
+            adsPluginPattern,
+            '',
+            'Native ads plugin'
+          );
+
+          // 程序启动时自动设置 DATA 路径
+          // 必须在 Tauri 和 Theseus 初始化之前执行
+          const mainMarker = 'fn main() {';
+
+          if (!rust.includes(mainMarker)) {
+            throw new Error('Rust main() function not found');
+          }
+
+          if (rust.includes('THESEUS_CONFIG_DIR')) {
+            throw new Error('Portable initialization already exists');
+          }
+
+          const portableInit = `
+              #[cfg(target_os = "windows")]
+              {
+                  let executable_dir = std::env::current_exe()
+                      .expect("Cannot locate executable")
+                      .parent()
+                      .expect("Cannot locate executable directory")
+                      .to_path_buf();
+
+                  let data_dir = executable_dir.join("DATA");
+                  let webview_dir = data_dir.join("webview2");
+
+                  std::fs::create_dir_all(&data_dir)
+                      .expect("Cannot create portable DATA directory");
+
+                  std::fs::create_dir_all(&webview_dir)
+                      .expect("Cannot create WebView2 directory");
+
+                  unsafe {
+                      std::env::set_var("THESEUS_CONFIG_DIR", &data_dir);
+                      std::env::set_var(
+                          "WEBVIEW2_USER_DATA_FOLDER",
+                          &webview_dir
+                      );
+                  }
+              }
+
+          `;
+
+          rust = rust.replace(
+            mainMarker,
+            mainMarker + portableInit
+          );
+
+          fs.writeFileSync(mainPath, rust, 'utf8');
+
+          console.log('Portable DATA initialization installed');
+          console.log('Native ads plugin disabled');
+
+          // ==========================================
+          // C. 修改前端广告逻辑
+          // ==========================================
+
+          const appVuePath = 'apps/app-frontend/src/App.vue';
+
+          let appVue = fs.readFileSync(appVuePath, 'utf8');
+
+          // 不再显示广告，也不再显示广告同意弹窗
+          const adBlockPattern =
+            /const showAd = computed\(\s*\(\) => sidebarVisible\.value && !hasPlus\.value && credentials\.value !== undefined,\s*\)\s*const adConsentAvailable = computed\(\(\) => credentials\.value !== undefined && !hasPlus\.value\)/m;
+
+          appVue = replaceExactlyOnce(
+            appVue,
+            adBlockPattern,
+            `const showAd = computed(() => false)
+          const adConsentAvailable = computed(() => false)`,
+            'Frontend ad visibility'
+          );
+
+          fs.writeFileSync(appVuePath, appVue, 'utf8');
+
+          // ==========================================
+          // D. 广告辅助接口改为空操作
+          // ==========================================
+
+          const adsHelperPath =
+            'apps/app-frontend/src/helpers/ads.js';
+
+          if (!fs.existsSync(adsHelperPath)) {
+            throw new Error('Ads helper file not found');
+          }
+
+          const adsHelper = `
+// Portable NoAds build
+// All advertisement functions are intentionally disabled.
+
+export async function init_ads_window() {}
+export async function take_ads_window_hold() {}
+export async function release_ads_window_hold() {}
+export async function hide_ads_window() {}
+
+export async function should_show_ads_consent_popup() {
+  return false;
+}
+
+export async function perform_ads_consent_action() {}
+export async function open_ads_consent_preferences() {}
+export async function record_ads_click() {}
+export async function open_ads_link() {}
+
+export async function get_ads_debug_state() {
+  return null;
+}
+`;
+
+          fs.writeFileSync(
+            adsHelperPath,
+            adsHelper,
+            'utf8'
+          );
+
+          console.log('Frontend ad helpers disabled');
+
+          // ==========================================
+          // E. 清理 Plus Banner 和广告页面
+          // ==========================================
+
           let bannerCount = 0;
+          let promoCount = 0;
 
           function walk(dir) {
             if (!fs.existsSync(dir)) return;
 
-            for (const e of fs.readdirSync(dir, {
+            for (const entry of fs.readdirSync(dir, {
               withFileTypes: true
             })) {
-              const full = path.join(dir, e.name);
+              const full = path.join(dir, entry.name);
 
-              if (e.isDirectory()) {
-                if (['node_modules', 'dist', '.turbo'].includes(e.name)) {
+              if (entry.isDirectory()) {
+                if (
+                  ['node_modules', '.turbo', 'dist'].includes(entry.name)
+                ) {
                   continue;
                 }
                 walk(full);
-              } else if (
-                e.isFile() &&
+                continue;
+              }
+
+              if (
+                entry.isFile() &&
                 full.endsWith('.vue')
               ) {
-                let txt = fs.readFileSync(full, 'utf8');
+                let content = fs.readFileSync(full, 'utf8');
 
-                const before = txt;
+                const before = content;
 
-                // 自闭合组件
-                txt = txt.replace(
+                content = content.replace(
                   /<ModrinthPlusBanner\b[^>]*\/>/g,
                   ''
                 );
 
-                // 完整组件
-                txt = txt.replace(
+                content = content.replace(
                   /<ModrinthPlusBanner\b[^>]*>[\s\S]*?<\/ModrinthPlusBanner\s*>/g,
                   ''
                 );
 
-                if (txt !== before) {
-                  fs.writeFileSync(full, txt, 'utf8');
+                if (content !== before) {
+                  fs.writeFileSync(full, content, 'utf8');
                   bannerCount++;
                 }
+              }
+
+              if (
+                entry.isFile() &&
+                entry.name.toLowerCase() === 'promo-frame.html'
+              ) {
+                fs.writeFileSync(full, '', 'utf8');
+                promoCount++;
               }
             }
           }
 
           walk('apps/app-frontend/src');
-          walk('apps/frontend/src');
+          walk('apps/app-frontend/public');
 
-          console.log('Banner files patched:', bannerCount);
+          console.log('Banner files modified:', bannerCount);
+          console.log('Promo files cleared:', promoCount);
 
-          // C. 清空广告页面
-          const promoPaths = [
-            'apps/frontend/src/public/promo-frame.html',
-            'apps/app-frontend/src/public/promo-frame.html'
-          ];
-
-          for (const p of promoPaths) {
-            if (fs.existsSync(p)) {
-              fs.writeFileSync(p, '', 'utf8');
-              console.log('Promo cleared:', p);
-            }
-          }
-
-          // D. 修改 Rust 主程序
-          const mainPath = 'apps/app/src/main.rs';
-          let rs = fs.readFileSync(mainPath, 'utf8');
-
-          // 禁用原生广告插件
-          const adsPattern =
-            /^[ \t]*\.plugin\(api::ads::init\(\)\)[ \t]*$/m;
-
-          if (adsPattern.test(rs)) {
-            rs = rs.replace(
-              adsPattern,
-              '        // .plugin(api::ads::init())'
-            );
-          } else {
-            throw new Error(
-              'Cannot locate ads plugin initialization'
-            );
-          }
-
-          // 将 Modrinth 核心数据重定向至 EXE 同级 DATA
-          const mainMarker = 'fn main() {';
-
-          if (!rs.includes(mainMarker)) {
-            throw new Error('Rust main function not found');
-          }
-
-          const portableCode = `fn main() {
-              #[cfg(target_os = "windows")]
-              {
-                  let data_dir = std::env::current_exe()
-                      .expect("Cannot locate executable")
-                      .parent()
-                      .expect("Cannot locate executable directory")
-                      .join("DATA");
-
-                  std::fs::create_dir_all(&data_dir)
-                      .expect("Cannot create portable DATA directory");
-
-                  unsafe {
-                      std::env::set_var("THESEUS_CONFIG_DIR", &data_dir);
-                  }
-              }
-          `;
-
-          rs = rs.replace(mainMarker, portableCode);
-
-          fs.writeFileSync(mainPath, rs, 'utf8');
-
-          console.log('Native ads disabled');
-          console.log('Portable DATA path configured');
-
+          console.log('All patches completed successfully');
           '@ | node -
 
-      # 9. 编译 Modrinth App
+      # 10. 编译
       - name: Build Tauri app
         run: pnpm app:build
 
-      # 10. 制作真正的便携版 ZIP
+      # 11. 检查并制作绿色版
       - name: Package Portable ZIP
         shell: pwsh
         run: |
-          $exePath = "target/release/Modrinth App.exe"
+          $releaseRoots = @(
+            "target/release",
+            "apps/app/target/release"
+          )
 
-          if (!(Test-Path $exePath)) {
-            throw "Build EXE not found: $exePath"
+          $exe = $null
+          $binaryRoot = $null
+
+          foreach ($root in $releaseRoots) {
+            if (!(Test-Path $root)) {
+              continue
+            }
+
+            $exe = Get-ChildItem `
+              -Path $root `
+              -Filter "*.exe" `
+              -File |
+              Where-Object {
+                $_.BaseName -eq "theseus_gui" -or
+                $_.BaseName -eq "Modrinth App"
+              } |
+              Select-Object -First 1
+
+            if ($exe) {
+              $binaryRoot = $root
+              break
+            }
           }
+
+          if (!$exe) {
+            throw "Compiled Modrinth executable not found"
+          }
+
+          Write-Host "Found executable: $($exe.FullName)"
 
           $packageDir = "Modrinth-Portable"
 
@@ -227,44 +388,74 @@ jobs:
           New-Item -ItemType Directory -Force `
             "$packageDir/DATA" | Out-Null
 
-          # 主程序
-          Copy-Item $exePath $packageDir
+          # 主程序统一命名
+          Copy-Item `
+            -LiteralPath $exe.FullName `
+            -Destination "$packageDir/Modrinth App.exe"
 
-          # 可选 WebView2 Loader
-          $loader = "target/release/WebView2Loader.dll"
+          # 附带编译目录中的动态库（如果有）
+          $dlls = Get-ChildItem `
+            -Path $binaryRoot `
+            -Filter "*.dll" `
+            -File
 
-          if (Test-Path $loader) {
-            Copy-Item $loader $packageDir
+          foreach ($dll in $dlls) {
+            Copy-Item `
+              -LiteralPath $dll.FullName `
+              -Destination $packageDir
           }
 
-          # 使用说明
+          # DATA 目录说明
           @"
           Modrinth App Portable NoAds
 
-          直接运行 Modrinth App.exe 即可。
+          Run Modrinth App.exe directly.
 
-          DATA 文件夹用于保存启动器数据：
-          - 账户和设置
-          - Minecraft 实例
-          - 游戏资源和 Libraries
-          - 缓存和数据库
+          All launcher data is stored in the DATA folder.
 
-          请勿删除 DATA 文件夹。
+          Do not delete the DATA folder.
 
-          请将整个文件夹放在有写入权限的位置。
-          Windows 需要 WebView2 Runtime。
-          "@ | Set-Content "$packageDir/README.txt" -Encoding UTF8
+          Keep the whole directory together when moving
+          this application to another drive or computer.
+
+          Windows WebView2 Runtime is required.
+          "@ | Set-Content `
+            "$packageDir/DATA/README.txt" `
+            -Encoding UTF8
+
+          @"
+          Modrinth App Portable NoAds
+
+          1. Run Modrinth App.exe.
+          2. Keep DATA next to the executable.
+          3. Back up the entire folder to preserve your data.
+          "@ | Set-Content `
+            "$packageDir/README.txt" `
+            -Encoding UTF8
+
+          $zip = "Modrinth-Win64-Portable-NoAds.zip"
+
+          if (Test-Path $zip) {
+            Remove-Item $zip -Force
+          }
 
           Compress-Archive `
             -Path "$packageDir/*" `
-            -DestinationPath "Modrinth-Win64-Portable-NoAds.zip" `
+            -DestinationPath $zip `
             -CompressionLevel Optimal `
             -Force
 
-          Write-Host "Portable ZIP packaged successfully"
+          if (!(Test-Path $zip)) {
+            throw "Portable ZIP creation failed"
+          }
 
-      # 11. 上传 GitHub Release
-      - name: Upload to GitHub Release
+          $size = (Get-Item $zip).Length / 1MB
+
+          Write-Host "Portable ZIP created: $zip"
+          Write-Host ("ZIP size: {0:N2} MB" -f $size)
+
+      # 12. 上传 GitHub Release
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: portable-win64-noads
