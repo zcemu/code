@@ -332,16 +332,65 @@ jobs:
       - name: Build Tauri app
         run: pnpm app:build
 
-      # 11. 检查 EXE 并制作绿色版
+
+      # 11. 自动查找 EXE 并制作绿色版
       - name: Package Portable ZIP
         shell: pwsh
         run: |
-          $binary = "target/release/theseus_gui.exe"
+          $searchRoots = @(
+            "target",
+            "apps/app/target"
+          )
 
-          if (!(Test-Path $binary)) {
-            throw "Compiled executable not found: $binary"
+          $exe = $null
+
+          foreach ($root in $searchRoots) {
+            if (!(Test-Path $root)) {
+              continue
+            }
+
+            $candidates = Get-ChildItem `
+              -Path $root `
+              -Filter "*.exe" `
+              -File `
+              -Recurse |
+              Where-Object {
+                $_.BaseName -eq "Modrinth App" -or
+                $_.BaseName -eq "theseus_gui"
+              }
+
+            if ($candidates) {
+              $exe = $candidates |
+                Sort-Object {
+                  if ($_.BaseName -eq "Modrinth App") {
+                    0
+                  } else {
+                    1
+                  }
+                } |
+                Select-Object -First 1
+
+              break
+            }
           }
 
+          if (!$exe) {
+            Write-Host "Executable candidates found:"
+            foreach ($root in $searchRoots) {
+              if (Test-Path $root) {
+                Get-ChildItem $root -Filter "*.exe" -File -Recurse |
+                  Select-Object -ExpandProperty FullName |
+                  Write-Host
+              }
+            }
+
+            throw "Modrinth App executable not found"
+          }
+
+          Write-Host "Found executable:"
+          Write-Host $exe.FullName
+
+          $binaryDir = $exe.DirectoryName
           $packageDir = "Modrinth-Portable"
 
           if (Test-Path $packageDir) {
@@ -351,13 +400,14 @@ jobs:
           New-Item -ItemType Directory -Force `
             "$packageDir/DATA" | Out-Null
 
+          # 复制并统一命名
           Copy-Item `
-            -LiteralPath $binary `
+            -LiteralPath $exe.FullName `
             -Destination "$packageDir/Modrinth App.exe"
 
-          # 附带编译目录中的 DLL
+          # 复制同目录 DLL
           Get-ChildItem `
-            -Path "target/release" `
+            -Path $binaryDir `
             -Filter "*.dll" `
             -File |
             ForEach-Object {
@@ -366,21 +416,22 @@ jobs:
                 -Destination $packageDir
             }
 
+          # 说明文件
           @"
           Modrinth App Portable NoAds
 
           Run Modrinth App.exe directly.
 
-          All launcher data is stored in DATA.
+          DATA folder must remain next to the executable.
 
-          Keep DATA next to the executable.
-          Back up the whole directory to preserve your data.
+          Back up the entire folder to preserve your data.
 
           Windows WebView2 Runtime is required.
           "@ | Set-Content `
             "$packageDir/README.txt" `
             -Encoding UTF8
 
+          # 压缩
           $zip = "Modrinth-Win64-Portable-NoAds.zip"
 
           if (Test-Path $zip) {
@@ -397,8 +448,9 @@ jobs:
             throw "ZIP creation failed"
           }
 
-          Write-Host "Portable ZIP created"
+          Write-Host "Portable ZIP created successfully"
           Write-Host "Size: $((Get-Item $zip).Length / 1MB) MB"
+
 
       # 12. 先上传 Actions 构建产物
       - name: Upload ZIP artifact
