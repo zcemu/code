@@ -32,11 +32,16 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Patch Tauri config (portable mode, node)
-        run: node scripts/patch.js
-
-      - name: Patch remove ads & plus banner (sed)
+      - name: Apply all patches (inline, no external files)
         run: |
+          node -e "
+            const fs = require('fs');
+            const p = 'apps/app/tauri.conf.json';
+            const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+            cfg.tauri.portable = true;
+            fs.writeFileSync(p, JSON.stringify(cfg, null, 2), 'utf8');
+            console.log('✅ Portable mode enabled');
+          "
           sed -i 's/init_ads();/\/\/ init_ads();/' apps/app/src/main.rs
           echo "" > apps/frontend/src/public/promo-frame.html
           sed -i 's/<ModrinthPlusBanner //<!-- <ModrinthPlusBanner /g' apps/frontend/**/*.vue
