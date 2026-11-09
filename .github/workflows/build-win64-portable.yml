@@ -32,20 +32,22 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Apply all patches (inline, no external files)
+      - name: Apply all patches (inline fixed)
         run: |
           node -e "
             const fs = require('fs');
             const p = 'apps/app/tauri.conf.json';
             const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
-            cfg.tauri.portable = true;
+            if (!cfg.bundle) cfg.bundle = {};
+            if (!cfg.bundle.windows) cfg.bundle.windows = {};
+            cfg.bundle.windows.portable = true;
             fs.writeFileSync(p, JSON.stringify(cfg, null, 2), 'utf8');
-            console.log('✅ Portable mode enabled');
+            console.log('✅ Portable enabled');
           "
           sed -i 's/init_ads();/\/\/ init_ads();/' apps/app/src/main.rs
           echo "" > apps/frontend/src/public/promo-frame.html
-          sed -i 's/<ModrinthPlusBanner //<!-- <ModrinthPlusBanner /g' apps/frontend/**/*.vue
-          sed -i 's/\/ModrinthPlusBanner>/\/ModrinthPlusBanner -->/g' apps/frontend/**/*.vue
+          find apps/frontend/src -type f -name "*.vue" -exec sed -i 's/<ModrinthPlusBanner /<!-- <ModrinthPlusBanner /g' {} \;
+          find apps/frontend/src -type f -name "*.vue" -exec sed -i 's/\/ModrinthPlusBanner>/\/ModrinthPlusBanner -->/g' {} \;
 
       - name: Build Tauri app
         run: pnpm app:build
