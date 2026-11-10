@@ -1,9 +1,6 @@
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-  push:
-    branches:
-      - main
 
 env:
   CARGO_TERM_COLOR: always
