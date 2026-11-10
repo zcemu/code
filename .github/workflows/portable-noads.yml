@@ -1,10 +1,9 @@
-
 name: Build Win64 Portable NoAds
 
 on:
   workflow_dispatch:
 
-# 避免重复构建
+# 同一时间只运行一个构建，新任务取消旧任务
 concurrency:
   group: modrinth-portable-win64
   cancel-in-progress: true
@@ -94,27 +93,21 @@ jobs:
 
           function replaceOnce(content, regex, replacement, name) {
             const matches = content.match(regex);
-
             if (!matches || matches.length !== 1) {
               throw new Error(
                 `${name}: expected exactly one match, found ${matches ? matches.length : 0}`
               );
             }
-
             return content.replace(regex, replacement);
           }
 
-          // ==========================================
           // A. Tauri 配置
-          // ==========================================
-
           const configPath = 'apps/app/tauri.conf.json';
           const config = JSON.parse(readFile(configPath));
 
           config.bundle = config.bundle || {};
           config.bundle.active = false;
 
-          // 移除广告 capability
           if (
             config.app &&
             config.app.security &&
@@ -126,22 +119,13 @@ jobs:
               );
           }
 
-          // 防止残留错误配置
           if (config.bundle.windows) {
             delete config.bundle.windows.portable;
           }
 
-          writeFile(
-            configPath,
-            JSON.stringify(config, null, 2)
-          );
+          writeFile(configPath, JSON.stringify(config, null, 2));
 
-          console.log('Tauri configuration updated');
-
-          // ==========================================
-          // B. Rust 原生广告插件
-          // ==========================================
-
+          // B. 移除 Rust 原生广告插件
           const mainPath = 'apps/app/src/main.rs';
           let rust = readFile(mainPath);
 
@@ -152,10 +136,7 @@ jobs:
             'Native ads plugin'
           );
 
-          // ==========================================
           // C. DATA 便携目录
-          // ==========================================
-
           const mainMarker = 'fn main() {';
 
           if (!rust.includes(mainMarker)) {
@@ -196,20 +177,10 @@ jobs:
             ''
           ].join('\n');
 
-          rust = rust.replace(
-            mainMarker,
-            mainMarker + portableCode
-          );
-
+          rust = rust.replace(mainMarker, mainMarker + portableCode);
           writeFile(mainPath, rust);
 
-          console.log('Portable DATA directory configured');
-          console.log('Native ads plugin disabled');
-
-          // ==========================================
           // D. 前端关闭广告显示
-          // ==========================================
-
           const appVuePath = 'apps/app-frontend/src/App.vue';
           let appVue = readFile(appVuePath);
 
@@ -235,13 +206,7 @@ jobs:
 
           writeFile(appVuePath, appVue);
 
-          console.log('Frontend ads disabled');
-
-          // ==========================================
           // E. 广告辅助函数改为空操作
-          // 保留源文件所有导出函数名称
-          // ==========================================
-
           const adsPath = 'apps/app-frontend/src/helpers/ads.js';
           const originalAds = readFile(adsPath);
 
@@ -268,15 +233,7 @@ jobs:
 
           writeFile(adsPath, stubCode);
 
-          console.log(
-            'Disabled ads helper functions:',
-            uniqueFunctions.length
-          );
-
-          // ==========================================
           // F. 移除 Plus Banner
-          // ==========================================
-
           let bannerCount = 0;
 
           function walk(dir) {
@@ -293,7 +250,6 @@ jobs:
                 ) {
                   continue;
                 }
-
                 walk(full);
                 continue;
               }
@@ -324,6 +280,10 @@ jobs:
 
           walk('apps/app-frontend/src');
 
+          console.log('Portable DATA directory configured');
+          console.log('Native ads plugin disabled');
+          console.log('Frontend ads disabled');
+          console.log('Disabled ads helper functions:', uniqueFunctions.length);
           console.log('Plus Banner files modified:', bannerCount);
           console.log('All patches completed successfully');
           '@ | node -
@@ -331,7 +291,6 @@ jobs:
       # 10. 编译 Modrinth App
       - name: Build Tauri app
         run: pnpm app:build
-
 
       # 11. 自动查找 EXE 并制作绿色版
       - name: Package Portable ZIP
@@ -376,6 +335,7 @@ jobs:
 
           if (!$exe) {
             Write-Host "Executable candidates found:"
+
             foreach ($root in $searchRoots) {
               if (Test-Path $root) {
                 Get-ChildItem $root -Filter "*.exe" -File -Recurse |
@@ -400,12 +360,10 @@ jobs:
           New-Item -ItemType Directory -Force `
             "$packageDir/DATA" | Out-Null
 
-          # 复制并统一命名
           Copy-Item `
             -LiteralPath $exe.FullName `
             -Destination "$packageDir/Modrinth App.exe"
 
-          # 复制同目录 DLL
           Get-ChildItem `
             -Path $binaryDir `
             -Filter "*.dll" `
@@ -416,14 +374,12 @@ jobs:
                 -Destination $packageDir
             }
 
-          # 说明文件
           @"
           Modrinth App Portable NoAds
 
           Run Modrinth App.exe directly.
 
           DATA folder must remain next to the executable.
-
           Back up the entire folder to preserve your data.
 
           Windows WebView2 Runtime is required.
@@ -431,7 +387,6 @@ jobs:
             "$packageDir/README.txt" `
             -Encoding UTF8
 
-          # 压缩
           $zip = "Modrinth-Win64-Portable-NoAds.zip"
 
           if (Test-Path $zip) {
@@ -450,8 +405,6 @@ jobs:
 
           Write-Host "Portable ZIP created successfully"
           Write-Host "Size: $((Get-Item $zip).Length / 1MB) MB"
-
-
 
       # 12. 生成 SHA256 校验文件
       - name: Generate SHA256 checksum
@@ -473,8 +426,19 @@ jobs:
 
           Write-Host "SHA256: $hash"
 
-      # 13. 发布 GitHub Release
-      - name: Publish GitHub Release
+      # 13. 上传 Actions 构建产物
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Modrinth-Win64-Portable-NoAds
+          path: |
+            Modrinth-Win64-Portable-NoAds.zip
+            Modrinth-Win64-Portable-NoAds.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      # 14. 发布 GitHub Release
+      - name: Modrinth App v${{ env.APP_VERSION }} - Win64 Portable NoAds
         uses: softprops/action-gh-release@v3
         with:
           tag_name: portable-win64-noads
