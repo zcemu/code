@@ -452,24 +452,66 @@ jobs:
           Write-Host "Size: $((Get-Item $zip).Length / 1MB) MB"
 
 
-      # 12. 先上传 Actions 构建产物
-      - name: Upload ZIP artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Modrinth-Win64-Portable-NoAds
-          path: Modrinth-Win64-Portable-NoAds.zip
-          if-no-files-found: error
-          retention-days: 14
+
+      # 12. 生成 SHA256 校验文件
+      - name: Generate SHA256 checksum
+        shell: pwsh
+        run: |
+          $zip = "Modrinth-Win64-Portable-NoAds.zip"
+
+          if (!(Test-Path $zip)) {
+            throw "Portable ZIP not found"
+          }
+
+          $hash = (Get-FileHash `
+            -Path $zip `
+            -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          "$hash  $zip" | Set-Content `
+            "$zip.sha256" `
+            -Encoding ascii
+
+          Write-Host "SHA256: $hash"
 
       # 13. 发布 GitHub Release
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: portable-win64-noads
           target_commitish: ${{ github.sha }}
           name: Modrinth Win64 Portable NoAds
+
+          body: |
+            ## 下载绿色版
+
+            **[点击下载 Modrinth Win64 Portable NoAds](https://github.com/${{ github.repository }}/releases/download/portable-win64-noads/Modrinth-Win64-Portable-NoAds.zip)**
+
+            ## 文件说明
+
+            - `Modrinth-Win64-Portable-NoAds.zip`：Windows 64 位便携版
+            - `Modrinth-Win64-Portable-NoAds.zip.sha256`：SHA256 校验文件
+
+            ## 使用说明
+
+            1. 下载 ZIP 并解压。
+            2. 运行 `Modrinth App.exe`。
+            3. 请保留旁边的 `DATA` 文件夹。
+            4. 更换硬盘或重装系统前，备份整个程序文件夹。
+
+            Windows WebView2 Runtime 为运行所需依赖。
+
+            ## 构建信息
+
+            - Build commit: `${{ github.sha }}`
+            - Platform: Windows x64
+            - Build type: Portable / NoAds
+
           prerelease: true
           make_latest: false
           overwrite_files: true
+          fail_on_unmatched_files: true
           generate_release_notes: false
-          files: Modrinth-Win64-Portable-NoAds.zip
+
+          files: |
+            Modrinth-Win64-Portable-NoAds.zip
+            Modrinth-Win64-Portable-NoAds.zip.sha256
