@@ -382,14 +382,6 @@
 							tone: 'orange',
 						},
 						{
-							id: 'tech-review',
-							label: formatMessage(messages.techReview),
-							icon: ShieldAlertIcon,
-							type: 'link',
-							to: '/moderation/technical-review',
-							tone: 'orange',
-						},
-						{
 							id: 'review-reports',
 							label: formatMessage(messages.reports),
 							icon: ReportIcon,
@@ -482,6 +474,14 @@
 							icon: ChartIcon,
 							type: 'link',
 							to: '/admin/analytics/events',
+							shown: isAdmin(auth.user),
+						},
+						{
+							id: 'copyright-archives',
+							label: 'Copyright archives',
+							icon: ChartIcon,
+							type: 'link',
+							to: '/admin/copyright-archives',
 							shown: isAdmin(auth.user),
 						},
 						{ type: 'divider' },
@@ -846,7 +846,6 @@ import {
 	ServerSearchIcon,
 	ServerStackIcon,
 	SettingsIcon,
-	ShieldAlertIcon,
 	SunIcon,
 	ToggleRightIcon,
 	TransferIcon,
@@ -1082,10 +1081,6 @@ const messages = defineMessages({
 	reviewProjects: {
 		id: 'layout.action.review-projects',
 		defaultMessage: 'Project review',
-	},
-	techReview: {
-		id: 'layout.action.tech-review',
-		defaultMessage: 'Tech review',
 	},
 	reports: {
 		id: 'layout.action.reports',

@@ -1004,26 +1004,17 @@
   "app.java-detection.title": {
     "message": "使用するJavaを選んでください"
   },
-  "app.java-selector.already-installed": {
-    "message": "インストール済み"
-  },
   "app.java-selector.browse": {
     "message": "探す"
   },
   "app.java-selector.detect": {
     "message": "検出"
   },
-  "app.java-selector.install-recommended": {
-    "message": "推奨をインストール"
-  },
   "app.java-selector.installing": {
     "message": "インストール中…"
   },
   "app.java-selector.path.placeholder": {
     "message": "/path/to/java"
-  },
-  "app.java-selector.test-installation": {
-    "message": "Javaのインストールをテスト"
   },
   "app.library.actions.label": {
     "message": "ライブラリの操作"
@@ -2510,14 +2501,8 @@
   "app.settings.resource-management.app-database-backups.title": {
     "message": "アプリデータベースのバックアップ"
   },
-  "app.settings.resource-management.app-directory.browse": {
-    "message": "アプリのディレクトリを参照"
-  },
   "app.settings.resource-management.app-directory.description": {
     "message": "Modrinth Appがインスタンスやその他のファイルを保存する場所です。変更はアプリの再起動後に反映されます。"
-  },
-  "app.settings.resource-management.app-directory.select": {
-    "message": "新しいアプリディレクトリを選択"
   },
   "app.settings.resource-management.app-directory.title": {
     "message": "アプリのディレクトリ"
@@ -3224,9 +3209,6 @@
   "instance.settings.tabs.hooks.pre-launch.enter": {
     "message": "起動前のコマンドを入力…"
   },
-  "instance.settings.tabs.hooks.title": {
-    "message": "カスタムゲーム起動フック"
-  },
   "instance.settings.tabs.hooks.variables.description": {
     "message": "フックはインスタンスの現在のディレクトリで実行され、以下の環境変数が利用可能です："
   },
@@ -3343,9 +3325,6 @@
   },
   "instance.settings.tabs.synced-options.shared-settings.description": {
     "message": "このインスタンスに対して同期設定を個別に保持するための上書きを有効にします。"
-  },
-  "instance.settings.tabs.window": {
-    "message": "カスタムウィンドウの設定"
   },
   "instance.settings.tabs.window.fullscreen": {
     "message": "フルスクリーン"

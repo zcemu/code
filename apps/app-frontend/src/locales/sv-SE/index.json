@@ -977,26 +977,17 @@
   "app.java-detection.title": {
     "message": "Välj java-installation"
   },
-  "app.java-selector.already-installed": {
-    "message": "Redan installerad"
-  },
   "app.java-selector.browse": {
     "message": "Bläddra"
   },
   "app.java-selector.detect": {
     "message": "Hitta"
   },
-  "app.java-selector.install-recommended": {
-    "message": "Installation rekommenderas"
-  },
   "app.java-selector.installing": {
     "message": "Installerar..."
   },
   "app.java-selector.path.placeholder": {
     "message": "/sökväg/till/java"
-  },
-  "app.java-selector.test-installation": {
-    "message": "Testa Java-installationen"
   },
   "app.library.actions.label": {
     "message": "Biblioteksåtgärder"
@@ -2687,14 +2678,8 @@
   "app.settings.resource-management.app-database-backups.title": {
     "message": "Säkerhetskopior av appdatabas"
   },
-  "app.settings.resource-management.app-directory.browse": {
-    "message": "Bläddra efter en appmapp"
-  },
   "app.settings.resource-management.app-directory.description": {
     "message": "Var Modrinth App lagrar instanser och andra filer. Ändringar träder i kraft efter appen startas om."
-  },
-  "app.settings.resource-management.app-directory.select": {
-    "message": "Välj en ny appmapp"
   },
   "app.settings.resource-management.app-directory.title": {
     "message": "Appmapp"
@@ -3706,9 +3691,6 @@
   },
   "instance.settings.tabs.syncing": {
     "message": "Synkronisering"
-  },
-  "instance.settings.tabs.window": {
-    "message": "Anpassade fönsterinställningar"
   },
   "instance.settings.tabs.window.fullscreen": {
     "message": "Helskärm"
