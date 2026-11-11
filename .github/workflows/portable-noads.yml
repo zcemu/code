@@ -1,9 +1,9 @@
+
 name: Build Win64 Portable NoAds
 
 on:
   workflow_dispatch:
 
-# 同一时间只运行一个构建，新任务取消旧任务
 concurrency:
   group: modrinth-portable-win64
   cancel-in-progress: true
@@ -18,36 +18,32 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      # 1. 获取源码
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # 2. 安装 pnpm
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 12.11.2
           run_install: false
 
-      # 3. 安装 Node
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
           cache: pnpm
 
-      # 4. 安装 Rust
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
           targets: x86_64-pc-windows-msvc
 
-      # 5. Rust 缓存
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
 
-      # 6. 检查环境
       - name: Verify toolchain
         shell: pwsh
         run: |
@@ -56,11 +52,91 @@ jobs:
           rustc --version
           cargo --version
 
-      # 7. 安装依赖
+      # 关键修复：编译前同步官方正式版本号
+      - name: Set official Modrinth App version
+        id: version
+        shell: pwsh
+        run: |
+          $headers = @{
+            "Accept" = "application/vnd.github+json"
+            "User-Agent" = "zcemu-portable-build"
+          }
+
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/modrinth/code/releases/latest" `
+            -Headers $headers
+
+          $tag = $release.tag_name
+
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            throw "Cannot obtain official Modrinth release version"
+          }
+
+          $version = $tag -replace '^v', ''
+
+          if ($version -match 'local|canary|dev') {
+            throw "Invalid official version: $version"
+          }
+
+          Write-Host "Official Modrinth version: $version"
+
+          # 修改前端 package.json
+          $frontendPath = "apps/app-frontend/package.json"
+          $frontend = Get-Content $frontendPath -Raw | ConvertFrom-Json
+          $frontend.version = $version
+          $frontend | ConvertTo-Json -Depth 100 |
+            Set-Content $frontendPath -Encoding UTF8
+
+          # 修改 Rust 主程序版本
+          $cargoPath = "apps/app/Cargo.toml"
+          $cargo = Get-Content $cargoPath -Raw
+          $cargo = [regex]::Replace(
+            $cargo,
+            '(?m)^version\s*=\s*"[^"]+"',
+            "version = `"$version`"",
+            1
+          )
+          Set-Content $cargoPath $cargo -Encoding UTF8
+
+          # 修改 app-lib 版本
+          $libPath = "packages/app-lib/Cargo.toml"
+          $lib = Get-Content $libPath -Raw
+          $lib = [regex]::Replace(
+            $lib,
+            '(?m)^version\s*=\s*"[^"]+"',
+            "version = `"$version`"",
+            1
+          )
+          Set-Content $libPath $lib -Encoding UTF8
+
+          # 检查三个文件
+          $frontendCheck = (Get-Content $frontendPath -Raw | ConvertFrom-Json).version
+          $cargoCheck = [regex]::Match(
+            (Get-Content $cargoPath -Raw),
+            '(?m)^version\s*=\s*"([^"]+)"'
+          ).Groups[1].Value
+          $libCheck = [regex]::Match(
+            (Get-Content $libPath -Raw),
+            '(?m)^version\s*=\s*"([^"]+)"'
+          ).Groups[1].Value
+
+          Write-Host "Frontend version: $frontendCheck"
+          Write-Host "Rust app version: $cargoCheck"
+          Write-Host "App-lib version: $libCheck"
+
+          if (
+            $frontendCheck -ne $version -or
+            $cargoCheck -ne $version -or
+            $libCheck -ne $version
+          ) {
+            throw "Application version synchronization failed"
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # 8. 配置生产环境
       - name: Setup production environment
         shell: pwsh
         run: |
@@ -73,7 +149,7 @@ jobs:
 
           Copy-Item $source $destination -Force
 
-      # 9. 去广告及便携化补丁
+      # 去广告及便携化补丁
       - name: Apply Portable and NoAds patches
         shell: pwsh
         run: |
@@ -117,10 +193,6 @@ jobs:
               config.app.security.capabilities.filter(
                 item => item !== 'ads'
               );
-          }
-
-          if (config.bundle.windows) {
-            delete config.bundle.windows.portable;
           }
 
           writeFile(configPath, JSON.stringify(config, null, 2));
@@ -184,22 +256,16 @@ jobs:
           const appVuePath = 'apps/app-frontend/src/App.vue';
           let appVue = readFile(appVuePath);
 
-          const showAdPattern =
-            /const showAd\s*=\s*computed\(\s*\(\)\s*=>\s*sidebarVisible\.value\s*&&\s*!hasPlus\.value\s*&&\s*credentials\.value\s*!==\s*undefined,\s*\)/m;
-
           appVue = replaceOnce(
             appVue,
-            showAdPattern,
+            /const showAd\s*=\s*computed\(\s*\(\)\s*=>\s*sidebarVisible\.value\s*&&\s*!hasPlus\.value\s*&&\s*credentials\.value\s*!==\s*undefined,\s*\)/m,
             'const showAd = computed(() => false)',
             'Frontend showAd'
           );
 
-          const consentPattern =
-            /const adConsentAvailable\s*=\s*computed\(\s*\(\)\s*=>\s*credentials\.value\s*!==\s*undefined\s*&&\s*!hasPlus\.value\s*\)/m;
-
           appVue = replaceOnce(
             appVue,
-            consentPattern,
+            /const adConsentAvailable\s*=\s*computed\(\s*\(\)\s*=>\s*credentials\.value\s*!==\s*undefined\s*&&\s*!hasPlus\.value\s*\)/m,
             'const adConsentAvailable = computed(() => false)',
             'Frontend ad consent'
           );
@@ -288,11 +354,11 @@ jobs:
           console.log('All patches completed successfully');
           '@ | node -
 
-      # 10. 编译 Modrinth App
+      # 构建
       - name: Build Tauri app
         run: pnpm app:build
 
-      # 11. 自动查找 EXE 并制作绿色版
+      # 打包绿色版
       - name: Package Portable ZIP
         shell: pwsh
         run: |
@@ -335,7 +401,6 @@ jobs:
 
           if (!$exe) {
             Write-Host "Executable candidates found:"
-
             foreach ($root in $searchRoots) {
               if (Test-Path $root) {
                 Get-ChildItem $root -Filter "*.exe" -File -Recurse |
@@ -343,7 +408,6 @@ jobs:
                   Write-Host
               }
             }
-
             throw "Modrinth App executable not found"
           }
 
@@ -357,21 +421,15 @@ jobs:
             Remove-Item $packageDir -Recurse -Force
           }
 
-          New-Item -ItemType Directory -Force `
-            "$packageDir/DATA" | Out-Null
+          New-Item -ItemType Directory -Force "$packageDir/DATA" |
+            Out-Null
 
-          Copy-Item `
-            -LiteralPath $exe.FullName `
+          Copy-Item -LiteralPath $exe.FullName `
             -Destination "$packageDir/Modrinth App.exe"
 
-          Get-ChildItem `
-            -Path $binaryDir `
-            -Filter "*.dll" `
-            -File |
+          Get-ChildItem -Path $binaryDir -Filter "*.dll" -File |
             ForEach-Object {
-              Copy-Item `
-                -LiteralPath $_.FullName `
-                -Destination $packageDir
+              Copy-Item -LiteralPath $_.FullName -Destination $packageDir
             }
 
           @"
@@ -381,11 +439,8 @@ jobs:
 
           DATA folder must remain next to the executable.
           Back up the entire folder to preserve your data.
-
           Windows WebView2 Runtime is required.
-          "@ | Set-Content `
-            "$packageDir/README.txt" `
-            -Encoding UTF8
+          "@ | Set-Content "$packageDir/README.txt" -Encoding UTF8
 
           $zip = "Modrinth-Win64-Portable-NoAds.zip"
 
@@ -406,24 +461,20 @@ jobs:
           Write-Host "Portable ZIP created successfully"
           Write-Host "Size: $((Get-Item $zip).Length / 1MB) MB"
 
-      # 12. 读取原版应用版本号
-      - name: Read original version
-        id: version
+      - name: Verify application version
         shell: pwsh
         run: |
-          $config = Get-Content "apps/app/tauri.conf.json" -Raw |
-            ConvertFrom-Json
+          $expected = "${{ steps.version.outputs.version }}"
 
-          $version = $config.version
+          $frontend = (Get-Content "apps/app-frontend/package.json" -Raw |
+            ConvertFrom-Json).version
 
-          if ([string]::IsNullOrWhiteSpace($version)) {
-            throw "Cannot read original application version"
+          if ($frontend -ne $expected) {
+            throw "Version mismatch: expected $expected, got $frontend"
           }
 
-          "version=$version" >> $env:GITHUB_OUTPUT
-          Write-Host "Original version: $version"
+          Write-Host "Verified application version: $expected"
 
-      # 13. 生成 SHA256
       - name: Generate SHA256 checksum
         shell: pwsh
         run: |
@@ -439,7 +490,6 @@ jobs:
 
           Write-Host "SHA256: $hash"
 
-      # 14. 发布 GitHub Release
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -467,7 +517,7 @@ jobs:
             4. 备份整个程序文件夹即可迁移数据。
 
             ### 构建信息
-            - Original version: ${{ steps.version.outputs.version }}
+            - Official version: ${{ steps.version.outputs.version }}
             - Commit: ${{ github.sha }}
             - Platform: Windows x64
             - Build: Portable / NoAds
