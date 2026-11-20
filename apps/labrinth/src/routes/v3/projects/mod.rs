@@ -27,7 +27,8 @@ use crate::models::link_platform::LinkPlatform;
 use crate::models::notifications::NotificationBody;
 use crate::models::pats::Scopes;
 use crate::models::projects::{
-    MonetizationStatus, Project, ProjectStatus, SideTypesMigrationReviewStatus,
+    ApprovalReason, AutoApprovalCause, MonetizationStatus, Project,
+    ProjectStatus, SideTypesMigrationReviewStatus,
 };
 use crate::models::teams::{DEFAULT_ROLE, ProjectPermissions};
 use crate::models::threads::MessageBody;
@@ -45,8 +46,8 @@ use crate::util::img;
 use crate::util::img::{delete_old_images, upload_image_optimized};
 use crate::util::routes::read_limited_from_payload;
 use actix_web::{HttpRequest, HttpResponse, delete, get, patch, post, web};
+use anyhow::anyhow;
 use chrono::Utc;
-use eyre::eyre;
 use futures::TryStreamExt;
 use itertools::Itertools;
 use rand::seq::SliceRandom;
@@ -106,7 +107,7 @@ pub async fn clear_project_cache_and_queue_search(
         redis,
     )
     .await
-    .wrap_internal_err("clearing cached data from Redis")?;
+    .internal_context("clearing cached data from Redis")?;
 
     search_state
         .queue
@@ -151,8 +152,8 @@ pub async fn random_projects_get(
 ) -> Result<HttpResponse, ApiError> {
     params
         .validate()
-        .map_err(|err| eyre::eyre!(err))
-        .wrap_request_err("validating request")?;
+        .map_err(|err| anyhow!(err))
+        .request_context("validating request")?;
 
     let statuses = crate::models::projects::ProjectStatus::iterator()
         .filter(|x| x.is_searchable())
@@ -191,7 +192,7 @@ pub async fn random_projects_get(
         .map_ok(|m| db_ids::DBProjectId(m.id))
         .try_collect::<Vec<_>>()
         .await
-        .wrap_internal_err("querying random project IDs")?
+        .internal_context("querying random project IDs")?
     } else {
         sqlx::query!(
             // IDs are randomly generated (see the `generate_ids` macro), so fetching a
@@ -211,7 +212,7 @@ pub async fn random_projects_get(
         .map_ok(|m| db_ids::DBProjectId(m.id))
         .try_collect::<Vec<_>>()
         .await
-        .wrap_internal_err("querying random project IDs")?
+        .internal_context("querying random project IDs")?
     };
 
     if params.project_type.is_some() {
@@ -222,7 +223,7 @@ pub async fn random_projects_get(
     let projects_data =
         db_models::DBProject::get_many_ids(&project_ids, &***ro_pool, &redis)
             .await
-            .wrap_internal_err("fetching projects by ID")?
+            .internal_context("fetching projects by ID")?
             .into_iter()
             .map(Project::from)
             .collect::<Vec<_>>();
@@ -254,7 +255,7 @@ pub async fn projects_get_route(
     session_queue: web::Data<AuthQueue>,
 ) -> Result<HttpResponse, ApiError> {
     let project_refs = serde_json::from_str::<Vec<String>>(&ids.ids)
-        .wrap_request_err("deserializing project references")?;
+        .request_context("deserializing project references")?;
     if let Some(response) = crate::routes::redirect_query_refs(
         &req,
         "ids",
@@ -280,11 +281,11 @@ pub async fn projects_get(
     session_queue: web::Data<AuthQueue>,
 ) -> Result<HttpResponse, ApiError> {
     let ids = serde_json::from_str::<Vec<&str>>(&ids.ids)
-        .wrap_request_err("deserializing JSON data")?;
+        .request_context("deserializing JSON data")?;
     let projects_data =
         db_models::DBProject::get_many(&ids, &***ro_pool, &redis)
             .await
-            .wrap_internal_err("fetching requested projects")?;
+            .internal_context("fetching requested projects")?;
 
     let user_option = get_user_from_headers(
         &req,
@@ -299,7 +300,7 @@ pub async fn projects_get(
     let projects =
         filter_visible_projects(projects_data, &user_option, &ro_pool, false)
             .await
-            .wrap_api_err("filtering visible projects")?;
+            .api_context("filtering visible projects")?;
 
     Ok(HttpResponse::Ok().json(projects))
 }
@@ -346,7 +347,7 @@ pub async fn project_get_internal(
 
     let project_data = db_models::DBProject::get(&string, &***ro_pool, &redis)
         .await
-        .wrap_internal_err("failed to fetch project")?;
+        .internal_context("failed to fetch project")?;
     let user_option = get_user_from_headers(
         &req,
         &***ro_pool,
@@ -360,11 +361,11 @@ pub async fn project_get_internal(
     if let Some(data) = project_data
         && is_visible_project(&data.inner, &user_option, &ro_pool, false)
             .await
-            .wrap_internal_err("failed to check project visibility")?
+            .internal_context("failed to check project visibility")?
     {
         return Ok(web::Json(Project::from(data)));
     }
-    Err(ApiError::NotFound(eyre::eyre!("resource not found")))
+    Err(ApiError::NotFound(anyhow!("resource not found")))
 }
 
 #[derive(Debug, Serialize, Deserialize, Validate, utoipa::ToSchema)]
@@ -515,21 +516,21 @@ pub async fn project_edit_internal(
         Scopes::PROJECT_WRITE,
     )
     .await
-    .wrap_auth_err("authenticating API request")?;
+    .auth_context("authenticating API request")?;
 
     new_project.validate().map_err(|err| {
         let message =
             crate::util::validate::validation_errors_to_string(err, None)
                 .replacen("Field ", "field ", 1);
-        ApiError::Request(eyre!(message))
+        ApiError::Request(anyhow!(message))
     })?;
 
     let Some(mut project_item) =
         db_models::DBProject::get(&info.into_inner().0, &**pool, &redis)
             .await
-            .wrap_internal_err("fetching project")?
+            .internal_context("fetching project")?
     else {
-        return Err(ApiError::NotFound(eyre::eyre!("resource not found")));
+        return Err(ApiError::NotFound(anyhow!("resource not found")));
     };
 
     let id = project_item.inner.id;
@@ -541,14 +542,14 @@ pub async fn project_edit_internal(
             &**pool,
         )
         .await
-        .wrap_internal_err("fetching team member from database")?;
+        .internal_context("fetching team member from database")?;
 
     let Some(perms) = ProjectPermissions::get_permissions_by_scopes(
         user.scopes,
         &team_member,
         &organization_team_member,
     ) else {
-        return Err(ApiError::Auth(eyre::eyre!(
+        return Err(ApiError::Auth(anyhow!(
             "You do not have permission to edit this project!",
         )));
     };
@@ -558,7 +559,7 @@ pub async fn project_edit_internal(
         && !user.scopes.contains(Scopes::MODERATION_WRITE);
 
     if submit_for_review && !perms.contains(ProjectPermissions::EDIT_DETAILS) {
-        return Err(ApiError::Auth(eyre!(
+        return Err(ApiError::Auth(anyhow!(
             "you do not have permission to submit this project for review"
         )));
     }
@@ -566,7 +567,7 @@ pub async fn project_edit_internal(
     let mut transaction = pool
         .begin()
         .await
-        .wrap_internal_err("starting database transaction")?;
+        .internal_context("starting database transaction")?;
     let locked_project = sqlx::query!(
         r#"
         SELECT status, slug
@@ -578,13 +579,13 @@ pub async fn project_edit_internal(
     )
     .fetch_one(&mut transaction)
     .await
-    .wrap_internal_err("locking project for editing")?;
+    .internal_context("locking project for editing")?;
     project_item.inner.status =
         ProjectStatus::from_string(&locked_project.status);
     project_item.inner.slug = locked_project.slug;
 
     if submit_for_review && project_item.inner.status.is_approved() {
-        return Err(ApiError::Auth(eyre!(
+        return Err(ApiError::Auth(anyhow!(
             "you do not have permission to submit this project for review"
         )));
     }
@@ -593,7 +594,7 @@ pub async fn project_edit_internal(
 
     if let Some(name) = &new_project.name {
         if !perms.contains(ProjectPermissions::EDIT_DETAILS) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You do not have the permissions to edit the name of this project!",
             )));
         }
@@ -609,12 +610,12 @@ pub async fn project_edit_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err("querying database for `project_edit_internal`")?;
+        .internal_context("querying database for `project_edit_internal`")?;
     }
 
     if let Some(summary) = &new_project.summary {
         if !perms.contains(ProjectPermissions::EDIT_DETAILS) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You do not have the permissions to edit the summary of this project!",
             )));
         }
@@ -630,14 +631,14 @@ pub async fn project_edit_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err("querying database for `project_edit_internal`")?;
+        .internal_context("querying database for `project_edit_internal`")?;
     }
 
     if let Some(status) = &new_project.status
         && !submit_for_review
     {
         if !perms.contains(ProjectPermissions::EDIT_DETAILS) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You do not have the permissions to edit the status of this project!",
             )));
         }
@@ -649,7 +650,7 @@ pub async fn project_edit_internal(
                 &mut transaction,
             )
             .await
-            .wrap_internal_err("failed to fetch project disclosures")?
+            .internal_context("failed to fetch project disclosures")?
             .into_iter()
             .find(|disclosure| {
                 matches!(
@@ -674,7 +675,7 @@ pub async fn project_edit_internal(
                 }
                 .upsert(&mut transaction)
                 .await
-                .wrap_internal_err("failed to upsert archival disclosure")?;
+                .internal_context("failed to upsert archival disclosure")?;
             }
         } else {
             if !(user.scopes.contains(Scopes::MODERATION_WRITE)
@@ -683,7 +684,7 @@ pub async fn project_edit_internal(
                 || project_item.inner.status.is_approved()
                     && status.can_be_requested())
             {
-                return Err(ApiError::Auth(eyre::eyre!(
+                return Err(ApiError::Auth(anyhow!(
                     "You don't have permission to set this status!",
                 )));
             }
@@ -699,11 +700,11 @@ pub async fn project_edit_internal(
                     &pool,
                 )
                 .await
-                .wrap_internal_err("fetching moderation lock from database")?
+                .internal_context("fetching moderation lock from database")?
                 && lock.moderator_id != db_ids::DBUserId::from(user.user.id)
                 && !lock.expired
             {
-                return Err(ApiError::Auth(eyre::eyre!(format!(
+                return Err(ApiError::Auth(anyhow!(format!(
                     "This project is currently being moderated by @{}. Please wait for them to finish or for the lock to expire.",
                     lock.moderator_username
                 ))));
@@ -724,24 +725,35 @@ pub async fn project_edit_internal(
                 )
                 .execute(&mut transaction)
                 .await
-                .wrap_internal_err(
+                .internal_context(
                     "querying database for `project_edit_internal`",
                 )?;
             }
 
             if status.is_approved() && !project_item.inner.status.is_approved()
             {
+                let reason =
+                    serde_json::to_value(ApprovalReason::ByUser(user.user.id))
+                        .internal_context(
+                            "serializing project approval reason",
+                        )?;
                 sqlx::query!(
                     "
                     UPDATE mods
-                    SET approved = COALESCE(approved, NOW()), initial_queued = NULL
+                    SET approved_because = CASE
+                            WHEN approved IS NULL THEN $2::jsonb
+                            ELSE approved_because
+                        END,
+                        approved = COALESCE(approved, NOW()),
+                        initial_queued = NULL
                     WHERE id = $1
                     ",
                     id as db_ids::DBProjectId,
+                    reason,
                 )
                 .execute(&mut transaction)
                 .await
-                .wrap_internal_err(
+                .internal_context(
                     "querying database for `project_edit_internal`",
                 )?;
             }
@@ -772,7 +784,7 @@ pub async fn project_edit_internal(
                 )
                 .execute(&mut transaction)
                 .await
-                .wrap_internal_err(
+                .internal_context(
                     "querying database for `project_edit_internal`",
                 )?;
             }
@@ -815,7 +827,7 @@ pub async fn project_edit_internal(
                 .map_ok(|c| db_models::DBUserId(c.id))
                 .try_collect::<Vec<_>>()
                 .await
-                .wrap_internal_err("fetching notified members from database")?;
+                .internal_context("fetching notified members from database")?;
 
                 NotificationBuilder {
                     body: NotificationBody::StatusChange {
@@ -826,7 +838,7 @@ pub async fn project_edit_internal(
                 }
                 .insert_many(notified_members.clone(), &mut transaction, &redis)
                 .await
-                .wrap_internal_err(
+                .internal_context(
                     "inserting database records for `project_edit_internal`",
                 )?;
 
@@ -845,7 +857,7 @@ pub async fn project_edit_internal(
                 }
                 .insert_many(notified_members, &mut transaction, &redis)
                 .await
-                .wrap_internal_err(
+                .internal_context(
                     "inserting database records for `project_edit_internal`",
                 )?;
             }
@@ -861,7 +873,7 @@ pub async fn project_edit_internal(
             }
             .insert(&mut transaction)
             .await
-            .wrap_internal_err(
+            .internal_context(
                 "inserting database records for `project_edit_internal`",
             )?;
 
@@ -876,7 +888,7 @@ pub async fn project_edit_internal(
             )
             .execute(&mut transaction)
             .await
-            .wrap_internal_err(
+            .internal_context(
                 "querying database for `project_edit_internal`",
             )?;
 
@@ -894,14 +906,14 @@ pub async fn project_edit_internal(
                     &mut transaction,
                 )
                 .await
-                .wrap_internal_err("failed to remove archival disclosure")?;
+                .internal_context("failed to remove archival disclosure")?;
             }
         }
     }
 
     if let Some(requested_status) = &new_project.requested_status {
         if !perms.contains(ProjectPermissions::EDIT_DETAILS) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You do not have the permissions to edit the requested status of this project!",
             )));
         }
@@ -910,7 +922,7 @@ pub async fn project_edit_internal(
             .map(|x| x.can_be_requested())
             .unwrap_or(true)
         {
-            return Err(ApiError::Request(eyre::eyre!(String::from(
+            return Err(ApiError::Request(anyhow!(String::from(
                 "Specified status cannot be requested!",
             ))));
         }
@@ -926,7 +938,7 @@ pub async fn project_edit_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err("querying database for `project_edit_internal`")?;
+        .internal_context("querying database for `project_edit_internal`")?;
     }
 
     if perms.contains(ProjectPermissions::EDIT_DETAILS) {
@@ -940,7 +952,7 @@ pub async fn project_edit_internal(
             )
             .execute(&mut transaction)
             .await
-            .wrap_internal_err(
+            .internal_context(
                 "updating database records for `project_edit_internal`",
             )?;
         }
@@ -955,7 +967,7 @@ pub async fn project_edit_internal(
             )
             .execute(&mut transaction)
             .await
-            .wrap_internal_err(
+            .internal_context(
                 "querying database for `project_edit_internal`",
             )?;
         }
@@ -970,7 +982,7 @@ pub async fn project_edit_internal(
             &mut transaction,
         )
         .await
-        .wrap_api_err("executing `edit_project_categories`")?;
+        .api_context("executing `edit_project_categories`")?;
     }
 
     if let Some(categories) = &new_project.additional_categories {
@@ -982,12 +994,12 @@ pub async fn project_edit_internal(
             &mut transaction,
         )
         .await
-        .wrap_api_err("executing `edit_project_categories`")?;
+        .api_context("executing `edit_project_categories`")?;
     }
 
     if let Some(license_url) = &new_project.license_url {
         if !perms.contains(ProjectPermissions::EDIT_DETAILS) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You do not have the permissions to edit the license URL of this project!",
             )));
         }
@@ -1003,12 +1015,12 @@ pub async fn project_edit_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err("querying database for `project_edit_internal`")?;
+        .internal_context("querying database for `project_edit_internal`")?;
     }
 
     if let Some(slug) = &new_project.slug {
         if !perms.contains(ProjectPermissions::EDIT_DETAILS) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You do not have the permissions to edit this project's URL!",
             )));
         }
@@ -1019,9 +1031,9 @@ pub async fn project_edit_internal(
             &redis,
         )
         .await
-        .wrap_internal_err("checking project slug availability")?;
+        .internal_context("checking project slug availability")?;
         if existing.is_some() {
-            return Err(ApiError::Request(eyre::eyre!(
+            return Err(ApiError::Request(anyhow!(
                 "Your URL is already being used by another project!",
             )));
         }
@@ -1042,12 +1054,12 @@ pub async fn project_edit_internal(
             )
             .fetch_one(&mut transaction)
             .await
-            .wrap_internal_err(
+            .internal_context(
                 "querying database for `project_edit_internal`",
             )?;
 
             if results.exists.unwrap_or(true) {
-                return Err(ApiError::Request(eyre::eyre!(
+                return Err(ApiError::Request(anyhow!(
                     "Your URL is already being used by another project!",
                 )));
             }
@@ -1064,12 +1076,12 @@ pub async fn project_edit_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err("querying database for `project_edit_internal`")?;
+        .internal_context("querying database for `project_edit_internal`")?;
     }
 
     if let Some(license) = &new_project.license_id {
         if !perms.contains(ProjectPermissions::EDIT_DETAILS) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You do not have the permissions to edit the license of this project!",
             )));
         }
@@ -1081,8 +1093,8 @@ pub async fn project_edit_internal(
         }
 
         spdx::Expression::parse(&license)
-            .map_err(|err| eyre::eyre!(err))
-            .wrap_request_err("parsing request value")?;
+            .map_err(|err| anyhow!(err))
+            .request_context("parsing request value")?;
 
         sqlx::query!(
             "
@@ -1095,14 +1107,14 @@ pub async fn project_edit_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err("querying database for `project_edit_internal`")?;
+        .internal_context("querying database for `project_edit_internal`")?;
     }
 
     if let Some(links) = &new_project.link_urls
         && !links.is_empty()
     {
         if !perms.contains(ProjectPermissions::EDIT_DETAILS) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You do not have the permissions to edit the links of this project!",
             )));
         }
@@ -1113,7 +1125,7 @@ pub async fn project_edit_internal(
                 platform
                     .parse::<LinkPlatform>()
                     .map(|platform| platform.to_string())
-                    .wrap_request_err_with(|| {
+                    .request_context_with(|| {
                         format!("platform `{platform}` does not exist")
                     })
             })
@@ -1129,13 +1141,13 @@ pub async fn project_edit_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err("querying database for `project_edit_internal`")?;
+        .internal_context("querying database for `project_edit_internal`")?;
 
         for (platform, url) in links {
             if let Some(url) = url {
                 let platform = platform
                     .parse::<LinkPlatform>()
-                    .wrap_request_err_with(|| {
+                    .request_context_with(|| {
                         format!("platform `{platform}` does not exist")
                     })?
                     .to_string();
@@ -1150,7 +1162,7 @@ pub async fn project_edit_internal(
                 )
                 .execute(&mut transaction)
                 .await
-                .wrap_internal_err(
+                .internal_context(
                     "querying database for `project_edit_internal`",
                 )?;
             }
@@ -1161,7 +1173,7 @@ pub async fn project_edit_internal(
             && (!project_item.inner.status.is_approved()
                 || moderation_message.is_some())
         {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You do not have the permissions to edit the moderation message of this project!",
             )));
         }
@@ -1177,7 +1189,7 @@ pub async fn project_edit_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err("querying database for `project_edit_internal`")?;
+        .internal_context("querying database for `project_edit_internal`")?;
     }
 
     if let Some(moderation_message_body) = &new_project.moderation_message_body
@@ -1186,7 +1198,7 @@ pub async fn project_edit_internal(
             && (!project_item.inner.status.is_approved()
                 || moderation_message_body.is_some())
         {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You do not have the permissions to edit the moderation message body of this project!",
             )));
         }
@@ -1202,12 +1214,12 @@ pub async fn project_edit_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err("querying database for `project_edit_internal`")?;
+        .internal_context("querying database for `project_edit_internal`")?;
     }
 
     if let Some(description) = &new_project.description {
         if !perms.contains(ProjectPermissions::EDIT_BODY) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You do not have the permissions to edit the description (body) of this project!",
             )));
         }
@@ -1223,12 +1235,12 @@ pub async fn project_edit_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err("querying database for `project_edit_internal`")?;
+        .internal_context("querying database for `project_edit_internal`")?;
     }
 
     if let Some(monetization_status) = &new_project.monetization_status {
         if !perms.contains(ProjectPermissions::EDIT_DETAILS) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You do not have the permissions to edit the monetization status of this project!",
             )));
         }
@@ -1238,7 +1250,7 @@ pub async fn project_edit_internal(
                 == MonetizationStatus::ForceDemonetized)
             && !user.scopes.contains(Scopes::MODERATION_WRITE)
         {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You do not have the permissions to edit the monetization status of this project!",
             )));
         }
@@ -1254,14 +1266,14 @@ pub async fn project_edit_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err("querying database for `project_edit_internal`")?;
+        .internal_context("querying database for `project_edit_internal`")?;
     }
 
     if let Some(side_types_migration_review_status) =
         &new_project.side_types_migration_review_status
     {
         if !perms.contains(ProjectPermissions::EDIT_DETAILS) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You do not have the permissions to edit the side types migration review status of this project!",
             )));
         }
@@ -1277,7 +1289,7 @@ pub async fn project_edit_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err("querying database for `project_edit_internal`")?;
+        .internal_context("querying database for `project_edit_internal`")?;
     }
 
     let mut edited_versions = Vec::new();
@@ -1288,11 +1300,11 @@ pub async fn project_edit_internal(
             &redis,
         )
         .await
-        .wrap_internal_err("fetching versions from database")?
+        .internal_context("fetching versions from database")?
         {
             let mut savepoint = sqlx_tracing::Acquire::begin(&mut transaction)
                 .await
-                .wrap_internal_err("starting version edit savepoint")?;
+                .internal_context("starting version edit savepoint")?;
             match super::versions::version_edit_in_transaction(
                 minecraft_meta.clone(),
                 req.clone(),
@@ -1314,13 +1326,13 @@ pub async fn project_edit_internal(
                 // projects with heterogeneous loaders across versions and is best
                 // handled with opportunistic update semantics
                 Ok((version, _)) => {
-                    savepoint.commit().await.wrap_internal_err(
+                    savepoint.commit().await.internal_context(
                         "committing version edit savepoint",
                     )?;
                     edited_versions.push(version);
                 }
                 Err(ApiError::Request(_)) => {
-                    savepoint.rollback().await.wrap_internal_err(
+                    savepoint.rollback().await.internal_context(
                         "rolling back version edit savepoint",
                     )?;
                 }
@@ -1344,7 +1356,7 @@ pub async fn project_edit_internal(
         };
 
         if !perms.contains(ProjectPermissions::EDIT_DETAILS) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You do not have the permissions to edit the components of this project!",
             )));
         }
@@ -1358,8 +1370,8 @@ pub async fn project_edit_internal(
             (None, Some(edit)) => {
                 // component is specified in the JSON and is non-null - create new component
                 *component =
-                    Some(edit.create().wrap_request_err_with(|| {
-                        eyre!(
+                    Some(edit.create().request_context_with(|| {
+                        anyhow!(
                             "failed to create `{}` component",
                             type_name::<E::Component>()
                         )
@@ -1367,14 +1379,12 @@ pub async fn project_edit_internal(
             }
             (Some(component), Some(edit)) => {
                 // edit component
-                edit.apply_to(component).await.wrap_internal_err_with(
-                    || {
-                        eyre!(
-                            "failed to update `{}` component",
-                            type_name::<E::Component>()
-                        )
-                    },
-                )?;
+                edit.apply_to(component).await.internal_context_with(|| {
+                    anyhow!(
+                        "failed to update `{}` component",
+                        type_name::<E::Component>()
+                    )
+                })?;
             }
         }
 
@@ -1400,7 +1410,7 @@ pub async fn project_edit_internal(
         perms,
     )
     .await
-    .wrap_api_err("updating Minecraft server component")?;
+    .api_context("updating Minecraft server component")?;
     reindex_versions |= update(
         &mut transaction,
         id,
@@ -1409,7 +1419,7 @@ pub async fn project_edit_internal(
         perms,
     )
     .await
-    .wrap_api_err("updating Minecraft Java server component")?;
+    .api_context("updating Minecraft Java server component")?;
     reindex_versions |= update(
         &mut transaction,
         id,
@@ -1418,7 +1428,7 @@ pub async fn project_edit_internal(
         perms,
     )
     .await
-    .wrap_api_err("updating Minecraft Bedrock server component")?;
+    .api_context("updating Minecraft Bedrock server component")?;
 
     let components_serial = project_item.inner.components.clone();
 
@@ -1426,7 +1436,7 @@ pub async fn project_edit_internal(
         &components_serial.component_kinds(),
         &exp::PROJECT_COMPONENT_RELATIONS,
     )
-    .wrap_request_err("invalid component kinds")?;
+    .request_context("invalid component kinds")?;
 
     sqlx::query!(
         "
@@ -1440,7 +1450,7 @@ pub async fn project_edit_internal(
     )
     .execute(&mut transaction)
     .await
-    .wrap_internal_err("failed to update components")?;
+    .internal_context("failed to update components")?;
 
     let reloaded_project = if validate_for_review {
         validate::ensure_project_is_valid_for_review(
@@ -1473,7 +1483,7 @@ pub async fn project_edit_internal(
         &redis,
     )
     .await
-    .wrap_api_err("deleting unused images")?;
+    .api_context("deleting unused images")?;
 
     if submit_for_review {
         reindex_versions |= submit_project_for_review(
@@ -1503,7 +1513,7 @@ pub async fn project_edit_internal(
     for version in &edited_versions {
         db_models::DBVersion::clear_cache(version, &redis)
             .await
-            .wrap_internal_err("clearing cached version data from Redis")?;
+            .internal_context("clearing cached version data from Redis")?;
     }
     if !edited_versions.is_empty() {
         search_state
@@ -1563,7 +1573,7 @@ async fn submit_project_for_review(
             &mut *transaction,
         )
         .await
-        .wrap_internal_err("failed to fetch project disclosures")?
+        .internal_context("failed to fetch project disclosures")?
         .into_iter()
         .find(|disclosure| {
             matches!(disclosure.disclosure, ProjectDisclosure::Archived { .. })
@@ -1581,7 +1591,7 @@ async fn submit_project_for_review(
             &mut *transaction,
         )
         .await
-        .wrap_internal_err("failed to remove archival disclosure")?;
+        .internal_context("failed to remove archival disclosure")?;
     }
 
     let mut state = mutation::sync_project_state(
@@ -1606,7 +1616,7 @@ async fn submit_project_for_review(
     )
     .execute(&mut *transaction)
     .await
-    .wrap_internal_err("querying database for `project_edit_internal`")?;
+    .internal_context("querying database for `project_edit_internal`")?;
 
     if state.status().is_approved()
         || !user.scopes.contains(Scopes::MODERATION_WRITE)
@@ -1614,7 +1624,15 @@ async fn submit_project_for_review(
                 state.status(),
                 ProjectStatus::Rejected | ProjectStatus::Withheld
             )
-            && state.try_auto_approve(transaction, redis).await?
+            && state
+                .try_auto_approve(
+                    AutoApprovalCause::Resubmission {
+                        user_id: user.user.id,
+                    },
+                    transaction,
+                    redis,
+                )
+                .await?
     {
         return Ok(true);
     }
@@ -1633,7 +1651,7 @@ async fn submit_project_for_review(
         .map_ok(|row| db_models::DBUserId(row.id))
         .try_collect::<Vec<_>>()
         .await
-        .wrap_internal_err("fetching notified members from database")?;
+        .internal_context("fetching notified members from database")?;
 
         NotificationBuilder {
             body: NotificationBody::StatusChange {
@@ -1644,7 +1662,7 @@ async fn submit_project_for_review(
         }
         .insert_many(notified_members.clone(), &mut *transaction, redis)
         .await
-        .wrap_internal_err(
+        .internal_context(
             "inserting database records for `project_edit_internal`",
         )?;
 
@@ -1657,7 +1675,7 @@ async fn submit_project_for_review(
         }
         .insert_many(notified_members, &mut *transaction, redis)
         .await
-        .wrap_internal_err(
+        .internal_context(
             "inserting database records for `project_edit_internal`",
         )?;
     }
@@ -1673,7 +1691,7 @@ async fn submit_project_for_review(
     }
     .insert(&mut *transaction)
     .await
-    .wrap_internal_err(
+    .internal_context(
         "inserting database records for `project_edit_internal`",
     )?;
 
@@ -1688,7 +1706,7 @@ async fn submit_project_for_review(
     )
     .execute(&mut *transaction)
     .await
-    .wrap_internal_err("querying database for `project_edit_internal`")?;
+    .internal_context("querying database for `project_edit_internal`")?;
 
     Ok(false)
 }
@@ -1702,7 +1720,7 @@ pub async fn edit_project_categories(
 ) -> Result<(), ApiError> {
     if !perms.contains(ProjectPermissions::EDIT_DETAILS) {
         let additional_str = if is_additional { "additional " } else { "" };
-        return Err(ApiError::Auth(eyre::eyre!(format!(
+        return Err(ApiError::Auth(anyhow!(format!(
             "You do not have the permissions to edit the {additional_str}categories of this project!"
         ))));
     }
@@ -1714,7 +1732,7 @@ pub async fn edit_project_categories(
             &mut *transaction,
         )
         .await
-        .wrap_internal_err("fetching category from Redis")?;
+        .internal_context("fetching category from Redis")?;
         // TODO: We should filter out categories that don't match the project type of any of the versions
         // ie: if mod and modpack both share a name this should only have modpack if it only has a modpack as a version
 
@@ -1730,7 +1748,7 @@ pub async fn edit_project_categories(
     }
     DBModCategory::insert_many(mod_categories, &mut *transaction)
         .await
-        .wrap_internal_err("inserting mod categories into database")?;
+        .internal_context("inserting mod categories into database")?;
 
     Ok(())
 }
@@ -1773,7 +1791,7 @@ pub async fn project_search(
     let results = search_backend
         .search_for_project(&SearchRequest::from(info), &redis)
         .await
-        .wrap_api_err("searching projects")?;
+        .api_context("searching projects")?;
 
     // TODO: add this back
     // let results = ReturnSearchResults {
@@ -1806,7 +1824,7 @@ pub async fn project_search_post(
     let results = search_backend
         .search_for_project(&info, &redis)
         .await
-        .wrap_api_err("searching projects")?;
+        .api_context("searching projects")?;
     Ok(web::Json(results))
 }
 
@@ -1849,14 +1867,14 @@ pub async fn project_get_check_internal(
 
     let project_data = db_models::DBProject::get(&slug, &**pool, &redis)
         .await
-        .wrap_internal_err("fetching project from database")?;
+        .internal_context("fetching project from database")?;
 
     if let Some(project) = project_data {
         Ok(HttpResponse::Ok().json(ProjectCheckResponse {
             id: models::ids::ProjectId::from(project.inner.id),
         }))
     } else {
-        Err(ApiError::NotFound(eyre::eyre!("resource not found")))
+        Err(ApiError::NotFound(anyhow!("resource not found")))
     }
 }
 
@@ -1909,7 +1927,7 @@ pub async fn dependency_list_internal(
 
     let result = db_models::DBProject::get(&string, &***ro_pool, &redis)
         .await
-        .wrap_internal_err("fetching project from database")?;
+        .internal_context("fetching project from database")?;
 
     let user_option = get_user_from_headers(
         &req,
@@ -1924,9 +1942,9 @@ pub async fn dependency_list_internal(
     if let Some(project) = result {
         if !is_visible_project(&project.inner, &user_option, &pool, false)
             .await
-            .wrap_api_err("checking project visibility")?
+            .api_context("checking project visibility")?
         {
-            return Err(ApiError::NotFound(eyre::eyre!("resource not found")));
+            return Err(ApiError::NotFound(anyhow!("resource not found")));
         }
 
         let dependencies = database::DBProject::get_dependencies(
@@ -1935,7 +1953,7 @@ pub async fn dependency_list_internal(
             &redis,
         )
         .await
-        .wrap_internal_err("fetching projects from database")?;
+        .internal_context("fetching projects from database")?;
         let project_ids = dependencies
             .iter()
             .filter_map(|x| {
@@ -1970,11 +1988,11 @@ pub async fn dependency_list_internal(
                     &redis,
                 )
                 .await
-                .wrap_err("fetching dependency versions")
+                .context("fetching dependency versions")
             },
         )
         .await
-        .wrap_internal_err("fetching project dependencies")?;
+        .internal_context("fetching project dependencies")?;
 
         let mut projects = filter_visible_projects(
             projects_result,
@@ -1983,7 +2001,7 @@ pub async fn dependency_list_internal(
             false,
         )
         .await
-        .wrap_api_err("filtering visible projects")?;
+        .api_context("filtering visible projects")?;
         let mut versions = filter_visible_versions(
             versions_result,
             &user_option,
@@ -1991,7 +2009,7 @@ pub async fn dependency_list_internal(
             &redis,
         )
         .await
-        .wrap_api_err("filtering visible versions")?;
+        .api_context("filtering visible versions")?;
 
         projects.sort_by_key(|b| Reverse(b.published));
         projects.dedup_by(|a, b| a.id == b.id);
@@ -2001,7 +2019,7 @@ pub async fn dependency_list_internal(
 
         Ok(HttpResponse::Ok().json(DependencyInfo { projects, versions }))
     } else {
-        Err(ApiError::NotFound(eyre::eyre!("resource not found")))
+        Err(ApiError::NotFound(anyhow!("resource not found")))
     }
 }
 
@@ -2047,7 +2065,7 @@ pub async fn projects_edit_route(
     search_state: web::Data<SearchState>,
 ) -> Result<HttpResponse, ApiError> {
     let project_refs = serde_json::from_str::<Vec<String>>(&ids.ids)
-        .wrap_request_err("deserializing project references")?;
+        .request_context("deserializing project references")?;
     if let Some(response) = crate::routes::redirect_query_refs(
         &req,
         "ids",
@@ -2091,16 +2109,16 @@ pub async fn projects_edit(
         Scopes::PROJECT_WRITE,
     )
     .await
-    .wrap_auth_err("authenticating API request")?;
+    .auth_context("authenticating API request")?;
 
     bulk_edit_project
         .validate()
-        .map_err(|err| eyre::eyre!(err))
-        .wrap_request_err("validating request")?;
+        .map_err(|err| anyhow!(err))
+        .request_context("validating request")?;
 
     let project_ids: Vec<db_ids::DBProjectId> =
         serde_json::from_str::<Vec<ProjectId>>(&ids.ids)
-            .wrap_request_err("deserializing JSON data")?
+            .request_context("deserializing JSON data")?
             .into_iter()
             .map(|x| x.into())
             .collect();
@@ -2108,13 +2126,13 @@ pub async fn projects_edit(
     let projects_data =
         db_models::DBProject::get_many_ids(&project_ids, &**pool, &redis)
             .await
-            .wrap_internal_err("fetching projects to edit")?;
+            .internal_context("fetching projects to edit")?;
 
     if let Some(id) = project_ids
         .iter()
         .find(|x| !projects_data.iter().any(|y| x == &&y.inner.id))
     {
-        return Err(ApiError::Request(eyre::eyre!(format!(
+        return Err(ApiError::Request(anyhow!(format!(
             "Project {} not found",
             ProjectId(id.0 as u64)
         ))));
@@ -2128,7 +2146,7 @@ pub async fn projects_edit(
         &team_ids, &**pool, &redis,
     )
     .await
-    .wrap_internal_err("fetching team members from database")?;
+    .internal_context("fetching team members from database")?;
 
     let organization_ids = projects_data
         .iter()
@@ -2140,7 +2158,7 @@ pub async fn projects_edit(
         &redis,
     )
     .await
-    .wrap_internal_err("fetching organizations from database")?;
+    .internal_context("fetching organizations from database")?;
 
     let organization_team_ids = organizations
         .iter()
@@ -2153,16 +2171,16 @@ pub async fn projects_edit(
             &redis,
         )
         .await
-        .wrap_internal_err("fetching team members from database")?;
+        .internal_context("fetching team members from database")?;
 
     let categories = db_models::categories::Category::list(&**pool, &redis)
         .await
-        .wrap_internal_err("fetching category from Redis")?;
+        .internal_context("fetching category from Redis")?;
 
     let mut transaction = pool
         .begin()
         .await
-        .wrap_internal_err("starting database transaction")?;
+        .internal_context("starting database transaction")?;
     let mut changed_projects = Vec::new();
 
     for project in projects_data {
@@ -2196,18 +2214,18 @@ pub async fn projects_edit(
 
             if team_member.is_some() {
                 if !permissions.contains(ProjectPermissions::EDIT_DETAILS) {
-                    return Err(ApiError::Auth(eyre::eyre!(format!(
+                    return Err(ApiError::Auth(anyhow!(format!(
                         "You do not have the permissions to bulk edit project {}!",
                         project.inner.name
                     ))));
                 }
             } else if project.inner.status.is_hidden() {
-                return Err(ApiError::Request(eyre::eyre!(format!(
+                return Err(ApiError::Request(anyhow!(format!(
                     "Project {} not found",
                     ProjectId(project.inner.id.0 as u64)
                 ))));
             } else {
-                return Err(ApiError::Auth(eyre::eyre!(format!(
+                return Err(ApiError::Auth(anyhow!(format!(
                     "You are not a member of project {}!",
                     project.inner.name
                 ))));
@@ -2240,7 +2258,7 @@ pub async fn projects_edit(
             &mut transaction,
         )
         .await
-        .wrap_api_err("executing `bulk_edit_project_categories`")?;
+        .api_context("executing `bulk_edit_project_categories`")?;
 
         reindex_versions |= bulk_edit_project_categories(
             &categories,
@@ -2257,7 +2275,7 @@ pub async fn projects_edit(
             &mut transaction,
         )
         .await
-        .wrap_api_err("executing `bulk_edit_project_categories`")?;
+        .api_context("executing `bulk_edit_project_categories`")?;
 
         if let Some(links) = &bulk_edit_project.link_urls {
             let platforms_to_delete = links
@@ -2266,7 +2284,7 @@ pub async fn projects_edit(
                     platform
                         .parse::<LinkPlatform>()
                         .map(|platform| platform.to_string())
-                        .wrap_request_err_with(|| {
+                        .request_context_with(|| {
                             format!("platform `{platform}` does not exist")
                         })
                 })
@@ -2282,13 +2300,13 @@ pub async fn projects_edit(
             )
             .execute(&mut transaction)
             .await
-            .wrap_internal_err("querying database for `projects_edit`")?;
+            .internal_context("querying database for `projects_edit`")?;
 
             for (platform, url) in links {
                 if let Some(url) = url {
                     let platform = platform
                         .parse::<LinkPlatform>()
-                        .wrap_request_err_with(|| {
+                        .request_context_with(|| {
                             format!("platform `{platform}` does not exist")
                         })?
                         .to_string();
@@ -2303,7 +2321,7 @@ pub async fn projects_edit(
                     )
                     .execute(&mut transaction)
                     .await
-                    .wrap_internal_err(
+                    .internal_context(
                         "querying database for `projects_edit`",
                     )?;
                 }
@@ -2406,7 +2424,7 @@ pub async fn bulk_edit_project_categories(
         )
         .execute(&mut *transaction)
         .await
-        .wrap_internal_err(
+        .internal_context(
             "querying database for `bulk_edit_project_categories`",
         )?;
 
@@ -2415,7 +2433,7 @@ pub async fn bulk_edit_project_categories(
             let category_id = all_db_categories
                 .iter()
                 .find(|x| x.category == category)
-                .wrap_request_err_with(|| {
+                .request_context_with(|| {
                     format!("category `{}` does not exist", category.clone())
                 })?
                 .id;
@@ -2427,7 +2445,7 @@ pub async fn bulk_edit_project_categories(
         }
         DBModCategory::insert_many(mod_categories, &mut *transaction)
             .await
-            .wrap_internal_err("inserting mod categories into database")?;
+            .internal_context("inserting mod categories into database")?;
     }
 
     Ok(changed)
@@ -2507,13 +2525,13 @@ pub async fn project_icon_edit_internal(
         Scopes::PROJECT_WRITE,
     )
     .await
-    .wrap_auth_err("authenticating API request")?;
+    .auth_context("authenticating API request")?;
     let string = info.into_inner().0;
 
     let project_item = db_models::DBProject::get(&string, &**pool, &redis)
         .await
-        .wrap_internal_err("fetching project from database")?
-        .wrap_request_err_with(|| {
+        .internal_context("fetching project from database")?
+        .request_context_with(|| {
             "the specified project does not exist!".to_string()
         })?;
 
@@ -2525,11 +2543,11 @@ pub async fn project_icon_edit_internal(
                 &**pool,
             )
             .await
-            .wrap_internal_err("fetching team member from database")?;
+            .internal_context("fetching team member from database")?;
 
         // Hide the project
         if team_member.is_none() && organization_team_member.is_none() {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "The specified project does not exist!",
             )));
         }
@@ -2542,7 +2560,7 @@ pub async fn project_icon_edit_internal(
         .unwrap_or_default();
 
         if !permissions.contains(ProjectPermissions::EDIT_DETAILS) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You don't have permission to edit this project's icon.",
             )));
         }
@@ -2572,12 +2590,12 @@ pub async fn project_icon_edit_internal(
         &**file_host,
     )
     .await
-    .wrap_api_err("uploading image")?;
+    .api_context("uploading image")?;
 
     let mut transaction = pool
         .begin()
         .await
-        .wrap_internal_err("starting database transaction")?;
+        .internal_context("starting database transaction")?;
 
     sqlx::query!(
         "
@@ -2592,7 +2610,7 @@ pub async fn project_icon_edit_internal(
     )
     .execute(&mut transaction)
     .await
-    .wrap_internal_err("querying database for `project_icon_edit_internal`")?;
+    .internal_context("querying database for `project_icon_edit_internal`")?;
 
     mutation::finalize_mutation(
         project_item.inner.id,
@@ -2618,7 +2636,7 @@ pub async fn project_icon_edit_internal(
         &**file_host,
     )
     .await
-    .wrap_api_err("deleting old images")?;
+    .api_context("deleting old images")?;
 
     search_state
         .queue
@@ -2685,13 +2703,13 @@ pub async fn delete_project_icon_internal(
         Scopes::PROJECT_WRITE,
     )
     .await
-    .wrap_auth_err("authenticating API request")?;
+    .auth_context("authenticating API request")?;
     let string = info.into_inner().0;
 
     let project_item = db_models::DBProject::get(&string, &**pool, &redis)
         .await
-        .wrap_internal_err("fetching project from database")?
-        .wrap_request_err_with(|| {
+        .internal_context("fetching project from database")?
+        .request_context_with(|| {
             "the specified project does not exist!".to_string()
         })?;
 
@@ -2703,11 +2721,11 @@ pub async fn delete_project_icon_internal(
                 &**pool,
             )
             .await
-            .wrap_internal_err("fetching team member from database")?;
+            .internal_context("fetching team member from database")?;
 
         // Hide the project
         if team_member.is_none() && organization_team_member.is_none() {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "The specified project does not exist!",
             )));
         }
@@ -2719,7 +2737,7 @@ pub async fn delete_project_icon_internal(
         .unwrap_or_default();
 
         if !permissions.contains(ProjectPermissions::EDIT_DETAILS) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You don't have permission to edit this project's icon.",
             )));
         }
@@ -2728,7 +2746,7 @@ pub async fn delete_project_icon_internal(
     let mut transaction = pool
         .begin()
         .await
-        .wrap_internal_err("starting database transaction")?;
+        .internal_context("starting database transaction")?;
 
     sqlx::query!(
         "
@@ -2740,9 +2758,7 @@ pub async fn delete_project_icon_internal(
     )
     .execute(&mut transaction)
     .await
-    .wrap_internal_err(
-        "querying database for `delete_project_icon_internal`",
-    )?;
+    .internal_context("querying database for `delete_project_icon_internal`")?;
 
     mutation::finalize_mutation(
         project_item.inner.id,
@@ -2760,7 +2776,7 @@ pub async fn delete_project_icon_internal(
         &**file_host,
     )
     .await
-    .wrap_api_err("deleting old images")?;
+    .api_context("deleting old images")?;
 
     search_state
         .queue
@@ -2849,8 +2865,8 @@ pub async fn add_gallery_item_internal(
     search_state: web::Data<SearchState>,
 ) -> Result<HttpResponse, ApiError> {
     item.validate()
-        .map_err(|err| eyre::eyre!(err))
-        .wrap_request_err("validating request")?;
+        .map_err(|err| anyhow!(err))
+        .request_context("validating request")?;
 
     let user = get_user_from_headers(
         &req,
@@ -2860,18 +2876,18 @@ pub async fn add_gallery_item_internal(
         Scopes::PROJECT_WRITE,
     )
     .await
-    .wrap_auth_err("authenticating API request")?;
+    .auth_context("authenticating API request")?;
     let string = info.into_inner().0;
 
     let project_item = db_models::DBProject::get(&string, &**pool, &redis)
         .await
-        .wrap_internal_err("fetching project from database")?
-        .wrap_request_err_with(|| {
+        .internal_context("fetching project from database")?
+        .request_context_with(|| {
             "the specified project does not exist!".to_string()
         })?;
 
     if project_item.gallery_items.len() > 64 {
-        return Err(ApiError::Auth(eyre::eyre!(
+        return Err(ApiError::Auth(anyhow!(
             "You have reached the maximum of gallery images to upload.",
         )));
     }
@@ -2884,11 +2900,11 @@ pub async fn add_gallery_item_internal(
                 &**pool,
             )
             .await
-            .wrap_internal_err("fetching team member from database")?;
+            .internal_context("fetching team member from database")?;
 
         // Hide the project
         if team_member.is_none() && organization_team_member.is_none() {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "The specified project does not exist!",
             )));
         }
@@ -2901,7 +2917,7 @@ pub async fn add_gallery_item_internal(
         .unwrap_or_default();
 
         if !permissions.contains(ProjectPermissions::EDIT_DETAILS) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You don't have permission to edit this project's gallery.",
             )));
         }
@@ -2931,14 +2947,14 @@ pub async fn add_gallery_item_internal(
         &**file_host,
     )
     .await
-    .wrap_api_err("uploading image")?;
+    .api_context("uploading image")?;
 
     if project_item
         .gallery_items
         .iter()
         .any(|x| x.image_url == upload_result.url)
     {
-        return Err(ApiError::Request(eyre::eyre!(
+        return Err(ApiError::Request(anyhow!(
             "You may not upload duplicate gallery images!",
         )));
     }
@@ -2946,7 +2962,7 @@ pub async fn add_gallery_item_internal(
     let mut transaction = pool
         .begin()
         .await
-        .wrap_internal_err("starting database transaction")?;
+        .internal_context("starting database transaction")?;
 
     if item.featured {
         sqlx::query!(
@@ -2960,7 +2976,7 @@ pub async fn add_gallery_item_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err(
+        .internal_context(
             "querying database for `add_gallery_item_internal`",
         )?;
     }
@@ -2981,7 +2997,7 @@ pub async fn add_gallery_item_internal(
         &mut transaction,
     )
     .await
-    .wrap_internal_err("inserting galleries into database")?;
+    .internal_context("inserting galleries into database")?;
 
     let validation_error = if !user.scopes.contains(Scopes::MODERATION_WRITE)
         && project_item.inner.status == ProjectStatus::Processing
@@ -3005,7 +3021,7 @@ pub async fn add_gallery_item_internal(
             &**file_host,
         )
         .await
-        .wrap_api_err("deleting rejected gallery image upload")?;
+        .api_context("deleting rejected gallery image upload")?;
         return Err(error);
     }
 
@@ -3095,11 +3111,11 @@ pub async fn edit_gallery_item_internal(
         Scopes::PROJECT_WRITE,
     )
     .await
-    .wrap_auth_err("authenticating API request")?;
+    .auth_context("authenticating API request")?;
 
     item.validate()
-        .map_err(|err| eyre::eyre!(err))
-        .wrap_request_err("validating request")?;
+        .map_err(|err| anyhow!(err))
+        .request_context("validating request")?;
 
     let result = sqlx::query!(
         "
@@ -3110,8 +3126,8 @@ pub async fn edit_gallery_item_internal(
     )
     .fetch_optional(&**pool)
     .await
-    .wrap_internal_err("querying database for `edit_gallery_item_internal`")?
-    .wrap_request_err_with(|| {
+    .internal_context("querying database for `edit_gallery_item_internal`")?
+    .request_context_with(|| {
         format!(
             "gallery item at URL `{}` is not part of the project's gallery",
             item.url
@@ -3124,8 +3140,8 @@ pub async fn edit_gallery_item_internal(
         &redis,
     )
     .await
-    .wrap_internal_err("fetching project from database")?
-    .wrap_request_err_with(|| {
+    .internal_context("fetching project from database")?
+    .request_context_with(|| {
         "the specified project does not exist!".to_string()
     })?;
 
@@ -3137,11 +3153,11 @@ pub async fn edit_gallery_item_internal(
                 &**pool,
             )
             .await
-            .wrap_internal_err("fetching team member from database")?;
+            .internal_context("fetching team member from database")?;
 
         // Hide the project
         if team_member.is_none() && organization_team_member.is_none() {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "The specified project does not exist!",
             )));
         }
@@ -3153,7 +3169,7 @@ pub async fn edit_gallery_item_internal(
         .unwrap_or_default();
 
         if !permissions.contains(ProjectPermissions::EDIT_DETAILS) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You don't have permission to edit this project's gallery.",
             )));
         }
@@ -3162,7 +3178,7 @@ pub async fn edit_gallery_item_internal(
     let mut transaction = pool
         .begin()
         .await
-        .wrap_internal_err("starting database transaction")?;
+        .internal_context("starting database transaction")?;
 
     if let Some(featured) = item.featured {
         if featured {
@@ -3177,7 +3193,7 @@ pub async fn edit_gallery_item_internal(
             )
             .execute(&mut transaction)
             .await
-            .wrap_internal_err("fetching featured status from database")?;
+            .internal_context("fetching featured status from database")?;
         }
 
         sqlx::query!(
@@ -3191,7 +3207,7 @@ pub async fn edit_gallery_item_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err(
+        .internal_context(
             "querying database for `edit_gallery_item_internal`",
         )?;
     }
@@ -3207,7 +3223,7 @@ pub async fn edit_gallery_item_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err(
+        .internal_context(
             "querying database for `edit_gallery_item_internal`",
         )?;
     }
@@ -3223,7 +3239,7 @@ pub async fn edit_gallery_item_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err(
+        .internal_context(
             "querying database for `edit_gallery_item_internal`",
         )?;
     }
@@ -3239,7 +3255,7 @@ pub async fn edit_gallery_item_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err(
+        .internal_context(
             "querying database for `edit_gallery_item_internal`",
         )?;
     }
@@ -3312,7 +3328,7 @@ pub async fn delete_gallery_item_internal(
         Scopes::PROJECT_WRITE,
     )
     .await
-    .wrap_auth_err("authenticating API request")?;
+    .auth_context("authenticating API request")?;
 
     let item = sqlx::query!(
         "
@@ -3323,8 +3339,8 @@ pub async fn delete_gallery_item_internal(
     )
     .fetch_optional(&**pool)
     .await
-    .wrap_internal_err("querying database for `delete_gallery_item_internal`")?
-    .wrap_request_err_with(|| {
+    .internal_context("querying database for `delete_gallery_item_internal`")?
+    .request_context_with(|| {
         format!(
             "gallery item at URL `{}` is not part of the project's gallery",
             item.url
@@ -3337,8 +3353,8 @@ pub async fn delete_gallery_item_internal(
         &redis,
     )
     .await
-    .wrap_internal_err("fetching project from database")?
-    .wrap_request_err_with(|| {
+    .internal_context("fetching project from database")?
+    .request_context_with(|| {
         "the specified project does not exist!".to_string()
     })?;
 
@@ -3350,11 +3366,11 @@ pub async fn delete_gallery_item_internal(
                 &**pool,
             )
             .await
-            .wrap_internal_err("fetching team member from database")?;
+            .internal_context("fetching team member from database")?;
 
         // Hide the project
         if team_member.is_none() && organization_team_member.is_none() {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "The specified project does not exist!",
             )));
         }
@@ -3367,7 +3383,7 @@ pub async fn delete_gallery_item_internal(
         .unwrap_or_default();
 
         if !permissions.contains(ProjectPermissions::EDIT_DETAILS) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You don't have permission to edit this project's gallery.",
             )));
         }
@@ -3376,7 +3392,7 @@ pub async fn delete_gallery_item_internal(
     let mut transaction = pool
         .begin()
         .await
-        .wrap_internal_err("starting database transaction")?;
+        .internal_context("starting database transaction")?;
 
     sqlx::query!(
         "
@@ -3387,9 +3403,7 @@ pub async fn delete_gallery_item_internal(
     )
     .execute(&mut transaction)
     .await
-    .wrap_internal_err(
-        "querying database for `delete_gallery_item_internal`",
-    )?;
+    .internal_context("querying database for `delete_gallery_item_internal`")?;
 
     mutation::finalize_mutation(
         project_item.inner.id,
@@ -3407,7 +3421,7 @@ pub async fn delete_gallery_item_internal(
         &**file_host,
     )
     .await
-    .wrap_api_err("deleting old images")?;
+    .api_context("deleting old images")?;
 
     search_state
         .queue
@@ -3472,7 +3486,7 @@ pub async fn project_delete_internal(
         Scopes::PROJECT_DELETE,
     )
     .await
-    .wrap_auth_err("authenticating API request")?;
+    .auth_context("authenticating API request")?;
     let string = info.into_inner().0;
 
     // In two cases, we return `The specified project does not exist!`:
@@ -3485,8 +3499,8 @@ pub async fn project_delete_internal(
 
     let project = db_models::DBProject::get(&string, &**pool, &redis)
         .await
-        .wrap_internal_err("failed to get project")?
-        .wrap_auth_err("the specified project does not exist")?;
+        .internal_context("failed to get project")?
+        .auth_context("the specified project does not exist")?;
 
     if !user.scopes.contains(Scopes::ADMIN_WRITE) {
         let (team_member, organization_team_member) =
@@ -3496,11 +3510,11 @@ pub async fn project_delete_internal(
                 &**pool,
             )
             .await
-            .wrap_internal_err("failed to get user team member permissions")?;
+            .internal_context("failed to get user team member permissions")?;
 
         // Hide the project
         if team_member.is_none() && organization_team_member.is_none() {
-            return Err(ApiError::Auth(eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "The specified project does not exist!"
             )));
         }
@@ -3513,7 +3527,7 @@ pub async fn project_delete_internal(
         .unwrap_or_default();
 
         if !permissions.contains(ProjectPermissions::DELETE_PROJECT) {
-            return Err(ApiError::Auth(eyre::eyre!(
+            return Err(ApiError::Auth(anyhow!(
                 "You don't have permission to delete this project!",
             )));
         }
@@ -3522,7 +3536,7 @@ pub async fn project_delete_internal(
     let mut transaction = pool
         .begin()
         .await
-        .wrap_internal_err("failed to start transaction")?;
+        .internal_context("failed to start transaction")?;
     let locked_project = sqlx::query!(
         r#"
         SELECT status, slug
@@ -3534,9 +3548,19 @@ pub async fn project_delete_internal(
     )
     .fetch_one(&mut transaction)
     .await
-    .wrap_internal_err("locking project for deletion")?;
+    .internal_context("locking project for deletion")?;
     let original_status = ProjectStatus::from_string(&locked_project.status);
     let original_slug = locked_project.slug;
+
+    if original_status.is_approved() {
+        crate::auth::validate::require_privileged_token(
+            &req,
+            &mut transaction,
+            &redis,
+        )
+        .await
+        .api_context("checking privileged token age")?;
+    }
 
     delphi::tech_review_queue::remove_projects(
         &[project.inner.id],
@@ -3544,7 +3568,7 @@ pub async fn project_delete_internal(
         &mut transaction,
     )
     .await
-    .wrap_internal_err("removing project from technical review queue")?;
+    .internal_context("removing project from technical review queue")?;
 
     // rejected & withheld projects are transferred to ghost so moderation data is preserved
     if matches!(
@@ -3573,7 +3597,7 @@ pub async fn project_delete_internal(
                 )
                 .fetch_one(&mut transaction)
                 .await
-                .wrap_internal_err("checking deleted slug availability")?
+                .internal_context("checking deleted slug availability")?
                 .exists;
 
                 if !taken {
@@ -3599,7 +3623,7 @@ pub async fn project_delete_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err(
+        .internal_context(
             "failed to detach project from organization and update slug",
         )?;
 
@@ -3615,11 +3639,11 @@ pub async fn project_delete_internal(
         .map_ok(|x| db_ids::DBUserId(x.user_id))
         .try_collect::<Vec<_>>()
         .await
-        .wrap_internal_err("failed to remove project team members")?;
+        .internal_context("failed to remove project team members")?;
 
         let new_member_id = db_ids::generate_team_member_id(&mut transaction)
             .await
-            .wrap_internal_err("failed to generate team member ID")?;
+            .internal_context("failed to generate team member ID")?;
         DBTeamMember {
             id: new_member_id,
             team_id: project.inner.team_id,
@@ -3634,7 +3658,7 @@ pub async fn project_delete_internal(
         }
         .insert(&mut transaction)
         .await
-        .wrap_internal_err("failed to transfer project ownership to ghost")?;
+        .internal_context("failed to transfer project ownership to ghost")?;
 
         ThreadMessageBuilder {
             author_id: Some(deleted_user),
@@ -3653,7 +3677,7 @@ pub async fn project_delete_internal(
         }
         .insert(&mut transaction)
         .await
-        .wrap_internal_err(
+        .internal_context(
             "failed to insert project transfer thread message",
         )?;
 
@@ -3666,7 +3690,7 @@ pub async fn project_delete_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err("failed to delete project from collections_mods")?;
+        .internal_context("failed to delete project from collections_mods")?;
 
         sqlx::query!(
             "
@@ -3677,7 +3701,7 @@ pub async fn project_delete_internal(
         )
         .execute(&mut transaction)
         .await
-        .wrap_internal_err("failed to delete project followers")?;
+        .internal_context("failed to delete project followers")?;
 
         mutation::finalize_project_edit(
             project.inner.id,
@@ -3695,10 +3719,10 @@ pub async fn project_delete_internal(
         cache_user_ids.push(deleted_user);
         db_models::DBUser::clear_project_cache(&cache_user_ids, &redis)
             .await
-            .wrap_internal_err("failed to clear user project cache")?;
+            .internal_context("failed to clear user project cache")?;
         DBTeamMember::clear_cache(project.inner.team_id, &redis)
             .await
-            .wrap_internal_err("clearing cached data from Redis")?;
+            .internal_context("clearing cached data from Redis")?;
         search_state
             .queue
             .push_project_removal(project.inner.id.into())
@@ -3713,12 +3737,12 @@ pub async fn project_delete_internal(
     let uploaded_images =
         db_models::DBImage::get_many_contexted(context, &mut transaction)
             .await
-            .wrap_internal_err("failed to get project images")?;
+            .internal_context("failed to get project images")?;
     for image in uploaded_images {
         image_item::DBImage::remove(image.id, &mut transaction, &redis)
             .await
-            .wrap_internal_err_with(|| {
-                eyre!("failed to remove project image `{:?}`", image.id)
+            .internal_context_with(|| {
+                anyhow!("failed to remove project image `{:?}`", image.id)
             })?;
     }
 
@@ -3731,7 +3755,7 @@ pub async fn project_delete_internal(
     )
     .execute(&mut transaction)
     .await
-    .wrap_internal_err("failed to delete project from collections_mods")?;
+    .internal_context("failed to delete project from collections_mods")?;
 
     let result = db_models::DBProject::remove(
         project.inner.id,
@@ -3739,12 +3763,12 @@ pub async fn project_delete_internal(
         &redis,
     )
     .await
-    .wrap_internal_err("failed to remove project")?;
+    .internal_context("failed to remove project")?;
 
     transaction
         .commit()
         .await
-        .wrap_internal_err("failed to commit transaction")?;
+        .internal_context("failed to commit transaction")?;
 
     if result.is_some() {
         db_models::DBProject::clear_cache(
@@ -3754,14 +3778,14 @@ pub async fn project_delete_internal(
             &redis,
         )
         .await
-        .wrap_internal_err("clearing cached data from Redis")?;
+        .internal_context("clearing cached data from Redis")?;
         search_state
             .queue
             .push_project_removal(project.inner.id.into())
             .await;
         Ok(())
     } else {
-        Err(ApiError::NotFound(eyre::eyre!("resource not found")))
+        Err(ApiError::NotFound(anyhow!("resource not found")))
     }
 }
 
@@ -3809,13 +3833,13 @@ pub async fn project_follow_internal(
         Scopes::USER_WRITE,
     )
     .await
-    .wrap_auth_err("authenticating API request")?;
+    .auth_context("authenticating API request")?;
     let string = info.into_inner().0;
 
     let project = db_models::DBProject::get(&string, &**pool, &redis)
         .await
-        .wrap_internal_err("fetching project from database")?
-        .wrap_request_err_with(|| {
+        .internal_context("fetching project from database")?
+        .request_context_with(|| {
             "the specified project does not exist!".to_string()
         })?;
 
@@ -3824,15 +3848,15 @@ pub async fn project_follow_internal(
 
     if !is_visible_project(&project.inner, &Some(user), &pool, false)
         .await
-        .wrap_api_err("checking project visibility")?
+        .api_context("checking project visibility")?
     {
-        return Err(ApiError::NotFound(eyre::eyre!("resource not found")));
+        return Err(ApiError::NotFound(anyhow!("resource not found")));
     }
 
     let mut transaction = pool
         .begin()
         .await
-        .wrap_internal_err("starting database transaction")?;
+        .internal_context("starting database transaction")?;
 
     let insert_result = sqlx::query!(
         "
@@ -3845,10 +3869,10 @@ pub async fn project_follow_internal(
     )
     .execute(&mut transaction)
     .await
-    .wrap_internal_err("querying database for `project_follow_internal`")?;
+    .internal_context("querying database for `project_follow_internal`")?;
 
     if insert_result.rows_affected() == 0 {
-        return Err(ApiError::Request(eyre::eyre!(
+        return Err(ApiError::Request(anyhow!(
             "you are already following this project",
         )));
     }
@@ -3863,12 +3887,12 @@ pub async fn project_follow_internal(
     )
     .execute(&mut transaction)
     .await
-    .wrap_internal_err("querying database for `project_follow_internal`")?;
+    .internal_context("querying database for `project_follow_internal`")?;
 
     transaction
         .commit()
         .await
-        .wrap_internal_err("committing database transaction")?;
+        .internal_context("committing database transaction")?;
 
     db_models::DBProject::clear_cache(
         project_id,
@@ -3877,7 +3901,7 @@ pub async fn project_follow_internal(
         &redis,
     )
     .await
-    .wrap_internal_err("clearing cached project data")?;
+    .internal_context("clearing cached project data")?;
 
     Ok(HttpResponse::NoContent().body(""))
 }
@@ -3926,13 +3950,13 @@ pub async fn project_unfollow_internal(
         Scopes::USER_WRITE,
     )
     .await
-    .wrap_auth_err("authenticating API request")?;
+    .auth_context("authenticating API request")?;
     let string = info.into_inner().0;
 
     let project = db_models::DBProject::get(&string, &**pool, &redis)
         .await
-        .wrap_internal_err("fetching project from database")?
-        .wrap_request_err_with(|| {
+        .internal_context("fetching project from database")?
+        .request_context_with(|| {
             "the specified project does not exist!".to_string()
         })?;
 
@@ -3942,7 +3966,7 @@ pub async fn project_unfollow_internal(
     let mut transaction = pool
         .begin()
         .await
-        .wrap_internal_err("starting database transaction")?;
+        .internal_context("starting database transaction")?;
 
     let delete_result = sqlx::query!(
         "
@@ -3954,10 +3978,10 @@ pub async fn project_unfollow_internal(
     )
     .execute(&mut transaction)
     .await
-    .wrap_internal_err("querying database for `project_unfollow_internal`")?;
+    .internal_context("querying database for `project_unfollow_internal`")?;
 
     if delete_result.rows_affected() == 0 {
-        return Err(ApiError::Request(eyre::eyre!(
+        return Err(ApiError::Request(anyhow!(
             "you are not following this project",
         )));
     }
@@ -3972,12 +3996,12 @@ pub async fn project_unfollow_internal(
     )
     .execute(&mut transaction)
     .await
-    .wrap_internal_err("querying database for `project_unfollow_internal`")?;
+    .internal_context("querying database for `project_unfollow_internal`")?;
 
     transaction
         .commit()
         .await
-        .wrap_internal_err("committing database transaction")?;
+        .internal_context("committing database transaction")?;
 
     db_models::DBProject::clear_cache(
         project_id,
@@ -3986,7 +4010,7 @@ pub async fn project_unfollow_internal(
         &redis,
     )
     .await
-    .wrap_internal_err("clearing cached project data")?;
+    .internal_context("clearing cached project data")?;
 
     Ok(HttpResponse::NoContent().body(""))
 }
@@ -4031,24 +4055,24 @@ pub async fn project_get_organization(
     let string = info.into_inner().0;
     let result = db_models::DBProject::get(&string, &**pool, &redis)
         .await
-        .wrap_internal_err("fetching project from database")?
-        .wrap_request_err_with(|| {
+        .internal_context("fetching project from database")?
+        .request_context_with(|| {
             "the specified project does not exist!".to_string()
         })?;
 
     if !is_visible_project(&result.inner, &current_user, &pool, false)
         .await
-        .wrap_api_err("checking project visibility")?
+        .api_context("checking project visibility")?
     {
-        Err(ApiError::Request(eyre::eyre!(
+        Err(ApiError::Request(anyhow!(
             "The specified project does not exist!",
         )))
     } else if let Some(organization_id) = result.inner.organization_id {
         let organization =
             db_models::DBOrganization::get_id(organization_id, &**pool, &redis)
                 .await
-                .wrap_internal_err("fetching organization from database")?
-                .wrap_request_err_with(|| {
+                .internal_context("fetching organization from database")?
+                .request_context_with(|| {
                     "the attached organization does not exist!".to_string()
                 })?;
 
@@ -4058,7 +4082,7 @@ pub async fn project_get_organization(
             &redis,
         )
         .await
-        .wrap_internal_err("fetching team members from database")?;
+        .internal_context("fetching team members from database")?;
 
         let users = crate::database::models::DBUser::get_many_ids(
             &members_data.iter().map(|x| x.user_id).collect::<Vec<_>>(),
@@ -4066,7 +4090,7 @@ pub async fn project_get_organization(
             &redis,
         )
         .await
-        .wrap_internal_err("fetching users from database")?;
+        .internal_context("fetching users from database")?;
         let logged_in = current_user
             .as_ref()
             .and_then(|user| {
@@ -4101,6 +4125,6 @@ pub async fn project_get_organization(
         );
         Ok(HttpResponse::Ok().json(organization))
     } else {
-        Err(ApiError::NotFound(eyre::eyre!("resource not found")))
+        Err(ApiError::NotFound(anyhow!("resource not found")))
     }
 }

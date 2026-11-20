@@ -1,4 +1,4 @@
-use eyre::eyre;
+use anyhow::anyhow;
 use xredis::RedisPool;
 
 use crate::auth::UserWithScopes;
@@ -13,7 +13,10 @@ use crate::database::{PgPool, PgTransaction, models as db_models};
 use crate::models::ids::ProjectId;
 use crate::models::notifications::NotificationBody;
 use crate::models::pats::Scopes;
-use crate::models::projects::{Project, ProjectStatus, Version};
+use crate::models::projects::{
+    ApprovalProvenance, ApprovalReason, AutoApprovalCause, Project,
+    ProjectStatus, Version,
+};
 use crate::models::thread_issues::{
     ThreadIssueContext, ThreadIssueTarget, ThreadIssueTeamMember,
     ThreadIssueValueState, ThreadIssueVerdict,
@@ -76,13 +79,14 @@ impl SyncedProjectState {
                 transaction,
             )
             .await
-            .wrap_internal_err("verifying project moderation issues")?;
+            .internal_context("verifying project moderation issues")?;
         }
         Ok(())
     }
 
     pub(crate) async fn try_auto_approve(
         &mut self,
+        cause: AutoApprovalCause,
         transaction: &mut PgTransaction<'_>,
         redis: &RedisPool,
     ) -> Result<bool, ApiError> {
@@ -90,19 +94,37 @@ impl SyncedProjectState {
             return Ok(false);
         };
         let old_status = self.project.status;
+        let provenance = ApprovalProvenance {
+            trigger: cause,
+            previous_status: old_status,
+            resolved_issue_ids: self
+                .thread_issues
+                .iter()
+                .map(|issue| issue.id.into())
+                .collect(),
+        };
+        let reason =
+            serde_json::to_value(ApprovalReason::Auto(provenance.clone()))
+                .internal_context("serializing project auto-approval reason")?;
 
         sqlx::query!(
             r#"
 			UPDATE mods
-			SET status = $1, approved = COALESCE(approved, NOW())
+			SET status = $1,
+			    approved_because = CASE
+			        WHEN approved IS NULL THEN $3::jsonb
+			        ELSE approved_because
+			    END,
+			    approved = COALESCE(approved, NOW())
 			WHERE id = $2
 			"#,
             new_status.as_str(),
             self.data.inner.id as DBProjectId,
+            reason,
         )
         .execute(&mut *transaction)
         .await
-        .wrap_internal_err("auto-approving project")?;
+        .internal_context("auto-approving project")?;
 
         self.verify_facets(transaction).await?;
 
@@ -111,13 +133,14 @@ impl SyncedProjectState {
             body: MessageBody::AutoApproval {
                 old_status,
                 new_status,
+                provenance: Some(provenance),
             },
             thread_id: self.data.thread_id,
             hide_identity: false,
         }
         .insert(transaction)
         .await
-        .wrap_internal_err("recording project auto-approval")?;
+        .internal_context("recording project auto-approval")?;
 
         let notified_members = sqlx::query!(
             r#"
@@ -129,7 +152,7 @@ impl SyncedProjectState {
         )
         .fetch_all(&mut *transaction)
         .await
-        .wrap_internal_err("fetching project approval notification recipients")?
+        .internal_context("fetching project approval notification recipients")?
         .into_iter()
         .map(|row| DBUserId(row.user_id))
         .collect::<Vec<_>>();
@@ -147,7 +170,7 @@ impl SyncedProjectState {
             NotificationBuilder { body }
                 .insert_many(notified_members.clone(), transaction, redis)
                 .await
-                .wrap_internal_err("notifying project team of auto-approval")?;
+                .internal_context("notifying project team of auto-approval")?;
         }
 
         self.data.inner.status = new_status;
@@ -199,7 +222,13 @@ pub(crate) async fn sync_project_state(
     if exited_projects.contains(&project_id)
         && state.status() == ProjectStatus::Processing
     {
-        state.try_auto_approve(transaction, redis).await?;
+        state
+            .try_auto_approve(
+                AutoApprovalCause::TechnicalReviewNoDetails,
+                transaction,
+                redis,
+            )
+            .await?;
     }
     Ok(state)
 }
@@ -213,7 +242,7 @@ async fn sync_technical_review(
         sqlx::query!("SELECT pg_advisory_xact_lock($1)", project_id.0)
             .fetch_one(&mut *transaction)
             .await
-            .wrap_internal_err("locking project state synchronization")?;
+            .internal_context("locking project state synchronization")?;
     }
 
     let exited_projects = delphi::tech_review_queue::sync_projects(
@@ -222,7 +251,7 @@ async fn sync_technical_review(
         transaction,
     )
     .await
-    .wrap_api_err("synchronizing project technical review state")?;
+    .api_context("synchronizing project technical review state")?;
     let queued_projects = sqlx::query_scalar!(
         r#"
 		SELECT project_id AS "project_id!: DBProjectId"
@@ -233,7 +262,7 @@ async fn sync_technical_review(
     )
     .fetch_all(&mut *transaction)
     .await
-    .wrap_internal_err("fetching synchronized technical review membership")?;
+    .internal_context("fetching synchronized technical review membership")?;
     Ok((exited_projects, queued_projects))
 }
 
@@ -250,7 +279,7 @@ pub(crate) async fn load_project_state(
     sqlx::query!("SELECT pg_advisory_xact_lock($1)", project_id.0)
         .fetch_one(&mut *transaction)
         .await
-        .wrap_internal_err("locking project state synchronization")?;
+        .internal_context("locking project state synchronization")?;
 
     let queued_projects = sqlx::query_scalar!(
         r#"
@@ -262,7 +291,7 @@ pub(crate) async fn load_project_state(
     )
     .fetch_all(&mut *transaction)
     .await
-    .wrap_internal_err("fetching synchronized technical review membership")?;
+    .internal_context("fetching synchronized technical review membership")?;
 
     load_project_state_with_membership(
         project_id,
@@ -287,22 +316,22 @@ async fn load_project_state_with_membership(
         redis,
     )
     .await
-    .wrap_internal_err("reloading project for state synchronization")?;
-    let data = projects.pop().wrap_not_found_err("resource not found")?;
+    .internal_context("reloading project for state synchronization")?;
+    let data = projects.pop().not_found_context("resource not found")?;
     let version_ids = sqlx::query_scalar!(
 		r#"SELECT id AS "id!: DBVersionId" FROM versions WHERE mod_id = $1 ORDER BY id"#,
 		project_id.0,
 	)
 	.fetch_all(&mut *transaction)
 	.await
-	.wrap_internal_err("fetching all project version IDs")?;
+	.internal_context("fetching all project version IDs")?;
     let versions = db_models::DBVersion::get_many_uncached(
         &version_ids,
         &mut *transaction,
         redis,
     )
     .await
-    .wrap_internal_err("reloading project versions for state synchronization")?
+    .internal_context("reloading project versions for state synchronization")?
     .into_iter()
     .map(Version::from)
     .collect::<Vec<_>>();
@@ -310,14 +339,14 @@ async fn load_project_state_with_membership(
     let available_categories =
         db_models::categories::Category::list(&mut *transaction, redis)
             .await
-            .wrap_internal_err("fetching project categories")?;
+            .internal_context("fetching project categories")?;
     let disclosures = db_models::DBProjectDisclosure::get_many_for_project(
         data.inner.id,
         false,
         &mut *transaction,
     )
     .await
-    .wrap_internal_err("fetching project disclosures")?
+    .internal_context("fetching project disclosures")?
     .into_iter()
     .map(|disclosure| disclosure.disclosure)
     .collect::<Vec<_>>();
@@ -338,7 +367,7 @@ async fn load_project_state_with_membership(
     )
     .fetch_all(&mut *transaction)
     .await
-    .wrap_internal_err("fetching project team members")?
+    .internal_context("fetching project team members")?
     .into_iter()
     .map(|member| ThreadIssueTeamMember {
         team_id: DBTeamId(member.team_id).into(),
@@ -367,7 +396,7 @@ async fn load_project_state_with_membership(
     let thread_issues =
         db_models::DBThreadIssue::sync_project_verdicts(&context, transaction)
             .await
-            .wrap_internal_err("synchronizing project thread issue verdicts")?;
+            .internal_context("synchronizing project thread issue verdicts")?;
 
     Ok(SyncedProjectState {
         data,
@@ -416,6 +445,7 @@ pub(crate) struct PreparedMutations {
 
 pub(crate) async fn prepare_technical_review_exits(
     project_ids: &[DBProjectId],
+    cause: AutoApprovalCause,
     transaction: &mut PgTransaction<'_>,
     pool: &PgPool,
     redis: &RedisPool,
@@ -429,7 +459,9 @@ pub(crate) async fn prepare_technical_review_exits(
         let mut state =
             load_project_state(project_id, transaction, pool, redis).await?;
         if state.status() == ProjectStatus::Processing {
-            state.try_auto_approve(transaction, redis).await?;
+            state
+                .try_auto_approve(cause.clone(), transaction, redis)
+                .await?;
         }
         states.push(state);
     }
@@ -466,7 +498,13 @@ pub(crate) async fn prepare_mutations(
         if exited_projects.contains(&project_id)
             && state.status() == ProjectStatus::Processing
         {
-            state.try_auto_approve(transaction, redis).await?;
+            state
+                .try_auto_approve(
+                    AutoApprovalCause::TechnicalReviewNoDetails,
+                    transaction,
+                    redis,
+                )
+                .await?;
         }
         states.push(state);
     }
@@ -478,7 +516,7 @@ pub(crate) async fn prepare_mutations(
             if state.project.status == ProjectStatus::Processing
                 && state.has_required_nags
             {
-                return Err(ApiError::Request(eyre!(
+                return Err(ApiError::Request(anyhow!(
                     "project cannot have required validation nags while in review"
                 )));
             }
@@ -497,7 +535,7 @@ impl PreparedMutations {
         transaction
             .commit()
             .await
-            .wrap_internal_err("committing project mutation")?;
+            .internal_context("committing project mutation")?;
 
         for state in &self.states {
             db_models::DBProject::clear_cache(
@@ -507,7 +545,7 @@ impl PreparedMutations {
                 redis,
             )
             .await
-            .wrap_internal_err("clearing cached project data")?;
+            .internal_context("clearing cached project data")?;
         }
 
         Ok(())
@@ -541,7 +579,7 @@ pub(crate) async fn finalize_project_edit(
             .is_some_and(|user| user.scopes.contains(Scopes::MODERATION_WRITE))
         && state.has_required_nags
     {
-        return Err(ApiError::Request(eyre!(
+        return Err(ApiError::Request(anyhow!(
             "project must have no required validation nags before or during review or approval"
         )));
     }
@@ -554,7 +592,7 @@ pub(crate) async fn finalize_project_edit(
             .iter()
             .any(|issue| issue.verdict == ThreadIssueVerdict::Open)
     {
-        return Err(ApiError::Request(eyre!(
+        return Err(ApiError::Request(anyhow!(
             "project must have no open moderation issues before review"
         )));
     }
@@ -565,7 +603,7 @@ pub(crate) async fn finalize_project_edit(
             .iter()
             .any(|issue| issue.verdict != ThreadIssueVerdict::Resolved)
         {
-            return Err(ApiError::Request(eyre!(
+            return Err(ApiError::Request(anyhow!(
                 "all moderation issues must be resolved before approval"
             )));
         }
@@ -576,7 +614,7 @@ pub(crate) async fn finalize_project_edit(
     transaction
         .commit()
         .await
-        .wrap_internal_err("committing project mutation")?;
+        .internal_context("committing project mutation")?;
 
     db_models::DBProject::clear_cache(
         project_id,
@@ -585,7 +623,7 @@ pub(crate) async fn finalize_project_edit(
         redis,
     )
     .await
-    .wrap_internal_err("clearing cached project data")?;
+    .internal_context("clearing cached project data")?;
 
     if original_slug != state.data.inner.slug {
         db_models::DBProject::clear_cache(
@@ -595,8 +633,89 @@ pub(crate) async fn finalize_project_edit(
             redis,
         )
         .await
-        .wrap_internal_err("clearing previous project slug cache")?;
+        .internal_context("clearing previous project slug cache")?;
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::ids::ThreadIssueId;
+    use ariadne::ids::UserId;
+    use serde_json::json;
+
+    #[test]
+    fn historical_auto_approval_message_has_no_provenance() {
+        let value = json!({
+            "type": "auto_approval",
+            "old_status": "processing",
+            "new_status": "approved"
+        });
+        let message: MessageBody =
+            serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(
+            &message,
+            MessageBody::AutoApproval {
+                provenance: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(message).unwrap(), value);
+    }
+
+    #[test]
+    fn thread_and_database_share_approval_provenance() {
+        let provenance = ApprovalProvenance {
+            trigger: AutoApprovalCause::Resubmission { user_id: UserId(1) },
+            previous_status: ProjectStatus::Rejected,
+            resolved_issue_ids: vec![ThreadIssueId(2)],
+        };
+        let reason =
+            serde_json::to_value(ApprovalReason::Auto(provenance.clone()))
+                .unwrap();
+        let message = MessageBody::AutoApproval {
+            old_status: ProjectStatus::Rejected,
+            new_status: ProjectStatus::Approved,
+            provenance: Some(provenance),
+        };
+        let value = serde_json::to_value(message).unwrap();
+        assert_eq!(reason["Auto"], value["provenance"]);
+        let round_trip: MessageBody =
+            serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(round_trip).unwrap(), value);
+    }
+
+    #[test]
+    fn manual_approval_reason_serializes_user_id() {
+        assert_eq!(
+            serde_json::to_value(ApprovalReason::ByUser(UserId(1))).unwrap(),
+            json!({ "ByUser": "1" }),
+        );
+    }
+
+    #[test]
+    fn auto_approval_reason_serializes_evidence() {
+        let reason = ApprovalReason::Auto(ApprovalProvenance {
+            trigger: AutoApprovalCause::ModeratorTechnicalReviewPass {
+                user_id: UserId(1),
+            },
+            previous_status: ProjectStatus::Processing,
+            resolved_issue_ids: vec![ThreadIssueId(2)],
+        });
+        assert_eq!(
+            serde_json::to_value(reason).unwrap(),
+            json!({
+                "Auto": {
+                    "trigger": {
+                        "type": "moderator_technical_review_pass",
+                        "user_id": "1"
+                    },
+                    "previous_status": "processing",
+                    "resolved_issue_ids": ["2"]
+                }
+            }),
+        );
+    }
 }
